@@ -1,1 +1,0 @@
-1.1.0: Active supported VM pages suppress legacy transfer fallback, including empty completed cutscene pages. NPC walking uses individual MZ animation counters instead of scene clock. All previous assets/UI fixes preserved. Test exiting downward after Map012 flashback and saving/reloading. Runtime testing pending.

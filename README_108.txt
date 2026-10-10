@@ -1,1 +1,0 @@
-1.0.8: NPC collision excludes the moving event itself. Logical route cells round interpolated positions rather than truncate. Blocked unskippable commands log once to route_blocked.log. Runtime cause still requires confirmation. Replay from normal save before memory. Run tools/build_deploy_v108.sh.
