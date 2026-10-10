@@ -1,0 +1,2 @@
+NARAKU PSP 1.0.7
+Fixes Map012 memory scene: NPC backward movement, facing while moving, walking frames for normal Enri/Emma sprites, full-resolution character frames with linear reduction. Original scripted poses retained. All 12 event pages regenerated. Saves unchanged. Run tools/build_deploy_v107.sh. Test from a save BEFORE entering the memory; restart scene rather than resuming emulator state. PSP/PPSSPP runtime validation pending.

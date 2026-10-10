@@ -7,11 +7,11 @@ import prepare_world_v060 as w
 def is_portrait(name):
     return name.startswith(('D-001','アマリア','エマ','エンリ立ち絵','エーベル兄','オリバー','ルーカス','吊るしエンリ'))
 
-def prepare(game,out):
+def prepare(game,out,names=None):
     key=bytes.fromhex(w.read_json(game/'data/System.json')['encryptionKey'])
     manifest=w.read_json(out/'picture_v050_manifest.json');report=[]
     for name,rid in manifest.items():
-        if not is_portrait(name):continue
+        if not is_portrait(name) or (names is not None and name not in names):continue
         src=w.resolve_named_file(game/'img/pictures',name,('.png_','.png'))
         image=w.load_encrypted_png(src,key)if src.name.endswith('.png_')else Image.open(src).convert('RGBA')
         bbox=image.getchannel('A').getbbox()

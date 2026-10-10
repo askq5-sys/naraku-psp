@@ -1,4 +1,4 @@
-"""Build exact volume/pitch/pan variants referenced by maps 001-045 and common events.
+"""Build exact volume/pitch/pan variants referenced by maps 001-064 and common events.
 IDs are assigned across all maps, so adding later assets cannot renumber early sounds.
 """
 import json, subprocess, tempfile
@@ -25,7 +25,7 @@ def prepare(game, out, world):
         mid=int(path.stem[3:]);mp=world.read_json(path)
         for ev in mp.get('events',[]):
             if ev:
-                for pg in ev.get('pages',[]):visit(pg.get('list',[]),mid<=45)
+                for pg in ev.get('pages',[]):visit(pg.get('list',[]),mid<=64)
     for ev in world.read_json(game/'data/CommonEvents.json'):
         if ev:visit(ev.get('list',[]),True)
     manifest=[]

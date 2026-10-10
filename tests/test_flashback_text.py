@@ -1,7 +1,7 @@
 from pathlib import Path
 import json,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[1];s=(root/'main.c').read_text()
-a=s.index('static void vm_wait_text(\n');b=s.index('static int vm_wait_choices(',a)
+a=s.index('static char *strip_message_font_controls(');b=s.index('static void vm_pump_stage_message(',a)
 pre=r'''#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>

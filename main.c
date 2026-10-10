@@ -6,14 +6,16 @@
 #include <pspdebug.h>
 #include <pspaudio.h>
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
 
-PSP_MODULE_INFO("NARAKU PSP", PSP_MODULE_USER, 1, 33);
+PSP_MODULE_INFO("NARAKU PSP", PSP_MODULE_USER, 1, 78);
 #include "runtime/player_animation.h"
+#include "runtime/render_boundaries.h"
 #include "runtime/pressing_room.h"
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 
@@ -147,6 +149,13 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define VM_OP_SAVE_ACCESS 36
 #define VM_OP_FADE_SCREEN 37
 #define VM_OP_NUMBER_INPUT 38
+#define VM_OP_PARTY 41
+#define VM_OP_BALLOON 42
+#define VM_OP_SCROLL_TEXT 43
+#define VM_OP_PARALLAX 39
+#define VM_OP_TEXT_TRANSPARENT 40
+#define VM_OP_TEXT_STYLE 44
+#define VM_OP_CHOICES_STYLE 45
 
 #define SCENE_ITEM 1
 #define SCENE_STATUS 2
@@ -196,7 +205,7 @@ PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
 #define MESSAGE_SURFACE_H 256
 #define MESSAGE_SURFACE_X 110
 #define MESSAGE_SURFACE_SCALE 2
-#define MESSAGE_SURFACE_Y 144
+#define MESSAGE_SURFACE_Y (g_runtime_message_position==0?-38:g_runtime_message_position==1?39:144)
 #define MESSAGE_SURFACE_BYTES (MESSAGE_SURFACE_W * MESSAGE_SURFACE_H * 4)
 #define FALL_ATLAS_PATH ASSET_ROOT "fall_atlas.rgba8888"
 #define LUCAS_FALL_ATLAS_PATH ASSET_ROOT "lucas_fall_atlas.rgba8888"
@@ -307,6 +316,9 @@ static uint8_t g_switches[MAX_SWITCHES];
 static int g_save_enabled = 1;
 static int32_t g_variables[MAX_VARIABLES];
 static int16_t g_items[MAX_ITEMS];
+#include "runtime/factory_puzzle.h"
+#include "runtime/consumed_items.h"
+#include "runtime/player_forms.h"
 static uint8_t g_self_switches[MAX_MAP_ID + 1][MAX_EVENT_ID];
 static float g_event_shift_x[MAX_EVENT_ID];
 static float g_event_shift_y[MAX_EVENT_ID];
@@ -341,6 +353,8 @@ static float g_camera_lock_x = 0.0f;
 static float g_camera_lock_y = 0.0f;
 static void *g_a1_overlay = NULL;
 static void *g_ui_char_atlas = NULL;
+static void *g_balloon_atlas = NULL;
+static int g_balloon_frames = 0, g_balloon_target = -1, g_balloon_id = 1;
 static void *g_fog_overlay = NULL;
 static void *g_key_anim = NULL;
 static uint32_t *g_runtime_message_surface = NULL;
@@ -384,6 +398,9 @@ static float g_camera_scroll_y = 0.0f;
 static int g_map_scroll_remaining, g_map_scroll_total;
 static float g_map_scroll_start_x, g_map_scroll_start_y, g_map_scroll_target_x, g_map_scroll_target_y;
 static float g_screen_shake_x = 0.0f;
+static float g_stage_parallax_y;
+static int g_stage_parallax_scrolling;
+static void clear_stage_parallel(void);
 
 /* RPG Maker screen tone persists between interpreter commands.  Keep the
  * actual RGB tone values instead of collapsing every non-black tone to zero.
@@ -466,6 +483,7 @@ typedef struct {
     int sprite_count;
     void *event_atlas;
     void *event_atlas_detail;
+    void *parallax_texture;
 
     const uint8_t *action_map;
     const uint8_t *step_map;
@@ -555,6 +573,9 @@ static size_t g_runtime_message_len = 0;
 static int g_pressing_room_frame = 0;
 static int g_laser_room_frame = 0, g_laser_stop_count = 0, g_laser_route_index = 0;
 static int g_runtime_message_active = 0;
+static int g_runtime_message_transparent = 0;
+static int g_runtime_message_background = 0, g_runtime_message_position = 2;
+static int g_choice_background = 0, g_choice_position = 2;
 static int g_runtime_message_openness = 0;
 
 /* ------------------------------------------------------------------------- */
@@ -690,7 +711,7 @@ static void fatal_error(const char *message)
 {
     pspDebugScreenInit();
     pspDebugScreenClear();
-    pspDebugScreenPrintf("\nNARAKU PSP 0.8.5\n\nERROR:\n%s\n", message);
+    pspDebugScreenPrintf("\nNARAKU PSP 1.7.8\n\nERROR:\n%s\n", message);
     pspDebugScreenPrintf("\nHOME: exit\n");
     while (1) sceDisplayWaitVblankStart();
 }
@@ -717,6 +738,27 @@ static void *load_exact_file(const char *path, size_t expected_size)
 
     sceKernelDcacheWritebackInvalidateAll();
     return data;
+}
+
+/* Retain only the currently selected alternate leader (512 KiB).
+ * Original Enri's atlas stays owned by main; no per-frame file reads. */
+static void *player_form_texture(void *normal)
+{
+    static void *alternate;
+    static int loaded_actor;
+    int actor=player_form_actor();
+    char path[128];
+    if(actor==1) {
+        if(alternate) {free(alternate);alternate=NULL;loaded_actor=0;}
+        return normal;
+    }
+    if(actor!=loaded_actor) {
+        free(alternate);alternate=NULL;
+        snprintf(path,sizeof(path),ASSET_ROOT "actor%02d_atlas.rgba8888",actor);
+        alternate=load_exact_file(path,CHAR_ATLAS_BYTES);
+        loaded_actor=actor;
+    }
+    return alternate ? alternate : normal;
 }
 
 static void *load_whole_file(const char *path, size_t *out_size)
@@ -927,6 +969,8 @@ static void draw_solid_rect(float x, float y, float w, float h, int r, int g, in
 /* ------------------------------------------------------------------------- */
 /* Runtime UTF-8 font                                                        */
 /* ------------------------------------------------------------------------- */
+
+#include "runtime/russian.inc"
 
 static int init_runtime_font(void)
 {
@@ -1193,7 +1237,8 @@ static void rasterize_glyph_to_message_surface(
 static int latin_word_cp(uint32_t cp)
 {
     return (cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
-           (cp >= '0' && cp <= '9') || cp == '\'' || cp == '-';
+           (cp >= '0' && cp <= '9') || cp == '\'' || cp == '-' ||
+           (g_language==4 && cp>=0x0400 && cp<=0x052f);
 }
 
 static int latin_word_width(const char *p, const char *end)
@@ -1294,11 +1339,12 @@ static void rasterize_utf8_wrapped_to_message_surface(
 /* Original ITB_ResizeMessageWindow: 54% width, three rows, bottom anchored.
  * Scale its 816x624 layout onto the PSP screen; text is top/left aligned. */
 #define MESSAGE_BOX_X 110
-#define MESSAGE_BOX_Y 210
+#define MESSAGE_BOX_Y (g_runtime_message_position==0?0:g_runtime_message_position==1?105:210)
 #define MESSAGE_BOX_W 260
 #define MESSAGE_BOX_H 62
 #define MESSAGE_NAME_H 26
 static int runtime_message_text_y(void) { return MESSAGE_BOX_Y + 8; }
+static int runtime_name_y(void) { return MESSAGE_BOX_Y?MESSAGE_BOX_Y-MESSAGE_NAME_H:MESSAGE_BOX_H; }
 
 static int runtime_speaker_width(void)
 {
@@ -1329,7 +1375,7 @@ static void rebuild_runtime_message_surface(void)
     if (g_runtime_speaker && g_runtime_speaker_len > 0) {
         rasterize_utf8_wrapped_to_message_surface(
             g_runtime_speaker, g_runtime_speaker_len,
-            MESSAGE_BOX_X + 8, (top - MESSAGE_NAME_H + 5) - MESSAGE_SURFACE_Y,
+            MESSAGE_BOX_X + 8, (runtime_name_y() + 5) - MESSAGE_SURFACE_Y,
             MESSAGE_BOX_X + runtime_speaker_width() - 6, 1, 0.75f
         );
     }
@@ -1491,12 +1537,14 @@ static void draw_runtime_choice_overlay(void)
     float h, x, y;
     if (!g_choice_active) return;
     h = g_choice_count * 16 + 12;
-    x = SCREEN_W - g_choice_window_width;
+    x = g_choice_position==0?0:g_choice_position==1?
+        (SCREEN_W-g_choice_window_width)*0.5f:SCREEN_W-g_choice_window_width;
     /* Original Window_ChoiceList.windowY anchors above the bottom message box,
      * even when that box is currently closed. Default choice position is right. */
-    y = MESSAGE_BOX_Y - h;
+    y = MESSAGE_BOX_Y>=SCREEN_H/2?MESSAGE_BOX_Y-h:MESSAGE_BOX_Y+MESSAGE_BOX_H;
     if (y < 0) y = 0;
-    draw_naraku_window(x, y, g_choice_window_width, h, g_window_opacity);
+    if(g_choice_background==0)draw_naraku_window(x,y,g_choice_window_width,h,g_window_opacity);
+    else if(g_choice_background==1)draw_solid_rect(x,y,g_choice_window_width,h,0,0,0,190);
     for (i = 0; i < g_choice_count; ++i) {
         if (i == g_choice_cursor)
             draw_solid_rect(x + 5, y + 6 + i * 16,
@@ -1539,13 +1587,16 @@ static void draw_runtime_message_overlay(void)
     has_speaker = g_runtime_speaker && g_runtime_speaker_len > 0;
     top = MESSAGE_BOX_Y;
 
-    draw_message_window_reveal(MESSAGE_BOX_X, top, MESSAGE_BOX_W,
+    if (g_runtime_message_background==1)
+        draw_solid_rect(MESSAGE_BOX_X,top,MESSAGE_BOX_W,MESSAGE_BOX_H,0,0,0,190);
+    if (!g_runtime_message_transparent && g_runtime_message_background==0)
+        draw_message_window_reveal(MESSAGE_BOX_X, top, MESSAGE_BOX_W,
                                MESSAGE_BOX_H, g_window_opacity);
 
-    if (has_speaker) {
+    if (has_speaker && !g_runtime_message_transparent && g_runtime_message_background==0) {
         /* Separate name plate, matching the small bordered speaker box in the
          * original rather than consuming the first line of the message box. */
-        draw_message_window_reveal(MESSAGE_BOX_X, top - MESSAGE_NAME_H,
+        draw_message_window_reveal(MESSAGE_BOX_X, runtime_name_y(),
                                    runtime_speaker_width(), MESSAGE_NAME_H,
                                    g_window_opacity);
     }
@@ -1669,7 +1720,7 @@ static int load_config(void)
     fclose(f);
 
     if (n >= 10 && memcmp(b, "NPS9", 4) == 0) {
-        if (b[4] <= 3) g_language = (int)b[4];
+        if (b[4] <= 4) g_language = (int)b[4];
         g_always_dash = b[5] ? 1 : 0;
         g_bgm_volume = b[6] <= 100 ? (int)b[6] : 75;
         g_se_volume = b[7] <= 100 ? (int)b[7] : 75;
@@ -1679,7 +1730,7 @@ static int load_config(void)
         return 1;
     }
     if (n >= 10 && memcmp(b, "NPS8", 4) == 0) {
-        if (b[4] <= 3) g_language = (int)b[4];
+        if (b[4] <= 4) g_language = (int)b[4];
         g_always_dash = b[5] ? 1 : 0;
         g_bgm_volume = b[6] <= 100 ? (int)b[6] : 75;
         g_se_volume = b[7] <= 100 ? (int)b[7] : 75;
@@ -1744,7 +1795,7 @@ static int load_saved_language(void)
 static void save_language(int lang)
 {
     if (lang < 0) lang = 0;
-    if (lang > 3) lang = 3;
+    if (lang > 4) lang = 4;
     g_language = lang;
     save_config();
 }
@@ -1763,14 +1814,15 @@ static int choose_language(int selected)
 {
     SceCtrlData pad;
     uint32_t prev = 0;
-    const char *names[4] = {
+    const char *names[5] = {
         "English",
         "Japanese",
         "Simplified Chinese",
-        "Traditional Chinese"
+        "Traditional Chinese",
+        "Russian"
     };
 
-    if (selected < 0 || selected > 3) selected = 0;
+    if (selected < 0 || selected > 4) selected = 0;
     pspDebugScreenInit();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
@@ -1779,10 +1831,10 @@ static int choose_language(int selected)
         int i;
         pspDebugScreenClear();
         pspDebugScreenSetXY(0, 1);
-        pspDebugScreenPrintf("NARAKU PSP 0.8.5\n\n");
+        pspDebugScreenPrintf("NARAKU PSP 1.7.8\n\n");
         pspDebugScreenPrintf("Choose language:\n\n");
 
-        for (i = 0; i < 4; ++i)
+        for (i = 0; i < 5; ++i)
             pspDebugScreenPrintf("%c %s\n", i == selected ? '>' : ' ', names[i]);
 
         pspDebugScreenPrintf("\nD-PAD: select   X: confirm\n");
@@ -1790,8 +1842,8 @@ static int choose_language(int selected)
         sceCtrlPeekBufferPositive(&pad, 1);
         {
             uint32_t pressed = pad.Buttons & ~prev;
-            if (pressed & PSP_CTRL_UP) selected = (selected + 3) & 3;
-            if (pressed & PSP_CTRL_DOWN) selected = (selected + 1) & 3;
+            if (pressed & PSP_CTRL_UP) selected = (selected + 4) % 5;
+            if (pressed & PSP_CTRL_DOWN) selected = (selected + 1) % 5;
             if (pressed & PSP_CTRL_CROSS) {
                 save_language(selected);
                 do {
@@ -2042,6 +2094,7 @@ static void play_vm_se(int se_id)
 
 static void reset_runtime_game_state(void)
 {
+    g_player_party_mask=1;
     int i;
     g_save_enabled = 1;
     memset(g_switches, 0, sizeof(g_switches));
@@ -2049,6 +2102,9 @@ static void reset_runtime_game_state(void)
     memset(g_items, 0, sizeof(g_items));
     memset(g_self_switches, 0, sizeof(g_self_switches));
     clear_event_routes();
+    g_balloon_frames = 0;
+    clear_stage_parallel();
+    g_stage_parallax_y=0;g_stage_parallax_scrolling=0;
     memset(g_event_shift_x, 0, sizeof(g_event_shift_x));
     memset(g_event_shift_y, 0, sizeof(g_event_shift_y));
     memset(g_event_move_speed, 0, sizeof(g_event_move_speed));
@@ -2143,10 +2199,13 @@ static int read_progress_file(const char *path, ProgressState *out)
         if (memcmp(header, "PG60", 4) == 0 || memcmp(header, "PG40", 4) == 0) {
             g_picture6_visible = header[12] ? 1 : 0;
             g_picture6_alpha = g_picture6_visible ? (header[13] ? (int)header[13] : 255) : 0;
-            if (header[14] >= 1 && header[14] <= 6)
-                g_player_move_speed_code = (int)header[14];
+            if ((header[14]&7) >= 1 && (header[14]&7) <= 6)
+                g_player_move_speed_code = (int)(header[14]&7);
             if (memcmp(header, "PG60", 4) == 0)
                 g_player_visible = (header[15] & 1) ? 1 : 0;
+            if (memcmp(header, "PG60", 4) == 0)
+                { player_form_restore_bits(header[15]);
+                  if(header[14]&192) g_player_party_mask=(uint8_t)(((header[15]>>2)&63)|(header[14]&192)); }
             if (memcmp(header, "PG60", 4) == 0)
                 g_save_enabled = (header[15] & 2) ? 0 : 1;
         } else {
@@ -2192,6 +2251,7 @@ static int read_progress_file(const char *path, ProgressState *out)
         reset_runtime_game_state();
         return 0;
     }
+    reconcile_consumed_items();
     if (out->direction_row < 0 || out->direction_row > 3) out->direction_row = 0;
     return 1;
 }
@@ -2212,8 +2272,8 @@ static int write_progress_file(
     header[11] = (uint8_t)(intro_done ? 1 : 0);
     header[12] = (uint8_t)(g_picture6_visible ? 1 : 0);
     header[13] = (uint8_t)(g_picture6_visible ? g_picture6_alpha : 0);
-    header[14] = (uint8_t)clamp_move_speed_code(g_player_move_speed_code);
-    header[15] = (uint8_t)((g_player_visible ? 1 : 0) | (g_save_enabled ? 0 : 2));
+    header[14] = (uint8_t)(clamp_move_speed_code(g_player_move_speed_code) | (g_player_party_mask&192));
+    header[15] = (uint8_t)((g_player_visible ? 1 : 0) | (g_save_enabled ? 0 : 2) | player_form_save_bits());
 
     f = fopen(path, "wb");
     if (!f) return 0;
@@ -2291,7 +2351,7 @@ static int load_from_slot(int slot, ProgressState *out)
 }
 
 static int save_slot_metadata(
-    int slot, int *map_id, int *tile_x, int *tile_y, uint32_t *playtime_seconds)
+    int slot, int *map_id, int *tile_x, int *tile_y, uint32_t *playtime_seconds, int *actor)
 {
     char path[192];
     FILE *f;
@@ -2308,6 +2368,7 @@ static int save_slot_metadata(
     }
     if (memcmp(h, "PG60", 4) != 0 && memcmp(h, "PG40", 4) != 0 &&
         memcmp(h, "PG30", 4) != 0) { fclose(f); return 0; }
+    if(actor)*actor=memcmp(h,"PG60",4)==0 ? player_actor_from_mask(((h[15]>>2)&63) | (h[14]&192)) : 1;
     if (map_id) *map_id = (int)read_u16_le(h + 4);
     if (tile_x) *tile_x = (int)read_u16_le(h + 6);
     if (tile_y) *tile_y = (int)read_u16_le(h + 8);
@@ -2387,7 +2448,7 @@ static int ui_label_text(int id, int lang, const char **text, size_t *len)
     const uint8_t *p;
     uint16_t lens[4];
     int i;
-    if (!g_ui.data || id < 0 || id >= g_ui.label_count || lang < 0 || lang > 3) return 0;
+    if (!g_ui.data || id < 0 || id >= g_ui.label_count || lang < 0 || lang > 4) return 0;
     off = read_u32_le(g_ui.label_table + id * 4);
     if (off + 8u > g_ui.blob_size) return 0;
     p = g_ui.blob + off;
@@ -2395,9 +2456,10 @@ static int ui_label_text(int id, int lang, const char **text, size_t *len)
     p += 8;
     for (i = 0; i < 4; ++i) {
         if ((size_t)(p - g_ui.blob) + lens[i] > g_ui.blob_size) return 0;
-        if (i == lang) {
+        if (i == vm_text_language(lang)) {
             if (text) *text = (const char *)p;
             if (len) *len = lens[i];
+            if(lang==4 && text && len)russian_lookup(text,len);
             return 1;
         }
         p += lens[i];
@@ -2416,7 +2478,7 @@ static int ui_item_text(
     const uint8_t *p;
     uint16_t lens[8];
     int i;
-    if (!g_ui.data || item_id < 0 || item_id >= g_ui.item_count || lang < 0 || lang > 3) return 0;
+    if (!g_ui.data || item_id < 0 || item_id >= g_ui.item_count || lang < 0 || lang > 4) return 0;
     rec = g_ui.item_table + item_id * UI_ITEM_REC_BYTES;
     off = read_u32_le(rec + 4);
     size = read_u32_le(rec + 8);
@@ -2431,11 +2493,15 @@ static int ui_item_text(
         size_t nl = lens[i * 2 + 0];
         size_t dl = lens[i * 2 + 1];
         if ((size_t)(p - (g_ui.blob + off)) + nl + dl > size) return 0;
-        if (i == lang) {
+        if (i == vm_text_language(lang)) {
             if (name) *name = (const char *)p;
             if (name_len) *name_len = nl;
             if (desc) *desc = (const char *)(p + nl);
             if (desc_len) *desc_len = dl;
+            if(lang==4) {
+                if(name && name_len)russian_lookup(name,name_len);
+                if(desc && desc_len)russian_lookup(desc,desc_len);
+            }
             return 1;
         }
         p += nl + dl;
@@ -2477,11 +2543,83 @@ static void ui_panel(float x, float y, float w, float h)
 
 #include "runtime/inventory.inc"
 
-static void ui_draw_value_number(int value, float x, float y)
+/* Settings values share one right edge in every language. */
+static void ui_draw_settings_value(const char *text, size_t len, float y)
+{
+    const char *p=text,*end=text+len;
+    float width=0;
+    int color=0;
+    while(p<end) {
+        const uint8_t *rec;
+        if(parse_text_color_escape(&p,end,&color))continue;
+        rec=font_find_glyph(utf8_next_cp(&p,end));
+        if(!rec)rec=font_find_glyph('?');
+        width+=(rec?rec[7]:10)*0.75f;
+    }
+    draw_utf8_wrapped(text,len,444.0f-width,y,444.0f,1);
+}
+
+static void ui_draw_value_number(int value, float y)
 {
     char buf[32];
-    snprintf(buf, sizeof(buf), "%d", value);
-    draw_utf8_wrapped(buf, strlen(buf), x, y, SCREEN_W - 18.0f, 1);
+    snprintf(buf,sizeof(buf),"%d",value);
+    ui_draw_settings_value(buf,strlen(buf),y);
+}
+
+/* Save-deletion UI follows the same language order as the game. */
+static const char *save_delete_label(int id)
+{
+    static const char *text[5][7]={
+        {"Delete save files","Delete all save files?","Language and settings will be kept.","Cancel","Delete","Save files deleted.","Some save files could not be deleted."},
+        {"セーブデータを消去","すべてのセーブデータを消去しますか？","言語と設定は保持されます。","キャンセル","消去","セーブデータを消去しました。","一部のセーブデータを消去できませんでした。"},
+        {"清空存档","清空所有存档？","语言和设置将保留。","取消","清空","存档已清空。","部分存档无法清空。"},
+        {"清空存檔","清空所有存檔？","語言和設定將保留。","取消","清空","存檔已清空。","部分存檔無法清空。"},
+        {"Удалить сохранения","Удалить все сохранения?","Язык и настройки сохранятся.","Отмена","Удалить","Сохранения удалены.","Не удалось удалить часть сохранений."}
+    };
+    int lang=g_language>=0 && g_language<5?g_language:0;
+    return text[lang][id>=0 && id<7?id:0];
+}
+
+static int ui_delete_save_files(void)
+{
+    char path[192];int slot,failed=0;
+    if(remove(PROGRESS_PATH)!=0 && errno!=ENOENT)failed=1;
+    for(slot=1;slot<=SAVE_SLOT_COUNT;++slot) {
+        save_slot_path(slot,path,sizeof(path));
+        if(remove(path)!=0 && errno!=ENOENT)failed=1;
+    }
+    return !failed;
+}
+
+static void ui_confirm_delete_saves(void)
+{
+    SceCtrlData pad;uint32_t prev;int yes=0,done=0,result=0;
+    sceCtrlPeekBufferPositive(&pad,1);prev=pad.Buttons;
+    while(!done) {
+        ui_frame_begin();ui_panel(30,70,420,130);
+        draw_utf8_wrapped(save_delete_label(1),strlen(save_delete_label(1)),48,88,430,1);
+        draw_utf8_wrapped(save_delete_label(2),strlen(save_delete_label(2)),48,118,430,1);
+        draw_solid_rect(yes?260:48,151,170,25,160,0,0,150);
+        draw_utf8_wrapped(save_delete_label(3),strlen(save_delete_label(3)),58,155,210,1);
+        draw_utf8_wrapped(save_delete_label(4),strlen(save_delete_label(4)),270,155,430,1);
+        ui_frame_end();sceCtrlPeekBufferPositive(&pad,1);
+        uint32_t pressed=pad.Buttons&~prev;
+        if(pressed&(PSP_CTRL_LEFT|PSP_CTRL_RIGHT))yes=!yes;
+        if(pressed&ui_cancel_mask())return;
+        if(pressed&ui_ok_mask()) {
+            if(!yes)return;
+            result=ui_delete_save_files();done=1;
+        }
+        prev=pad.Buttons;
+    }
+    do {
+        ui_frame_begin();ui_panel(30,90,420,80);
+        const char *text=save_delete_label(result?5:6);
+        draw_utf8_wrapped(text,strlen(text),48,112,430,2);
+        ui_frame_end();sceCtrlPeekBufferPositive(&pad,1);
+        uint32_t pressed=pad.Buttons&~prev;prev=pad.Buttons;
+        if(pressed&(ui_ok_mask()|ui_cancel_mask()))break;
+    }while(1);
 }
 
 static void ui_options_scene(void)
@@ -2490,7 +2628,7 @@ static void ui_options_scene(void)
     uint32_t prev;
     int cursor = 0;
     int running = 1;
-    const int rows = 6;
+    const int rows = 7;
 
     /* Settings is normally entered with X.  Do not reinterpret that still-
      * held X as an immediate press on the Language row (the 0.6.1 bug that
@@ -2504,25 +2642,29 @@ static void ui_options_scene(void)
         ui_panel(20, 12, SCREEN_W - 40, 248);
         ui_draw_label(UI_L_OPTIONS_TITLE, 34, 20, 450, 1);
         for (i = 0; i < rows; ++i) {
-            float y = 56.0f + i * 31.0f;
+            float y = 56.0f + i * 27.0f;
             if (i == cursor)
                 draw_solid_rect(29, y - 3, 422, 29, 58, 68, 94, 210);
             if (i == 0) {
-                static const char *langs[4] = {"English", "日本語", "简体中文", "繁體中文"};
+                static const char *langs[5] = {"English", "日本語", "简体中文", "繁體中文", "Русский"};
                 ui_draw_label(UI_L_LANGUAGE, 38, y, 280, 1);
-                draw_utf8_wrapped(langs[g_language], strlen(langs[g_language]), 300, y, 444, 1);
+                ui_draw_settings_value(langs[g_language],strlen(langs[g_language]),y);
             } else if (i == 1) {
                 ui_draw_label(UI_L_ALWAYS_DASH, 38, y, 300, 1);
-                ui_draw_label(g_always_dash ? UI_L_ON : UI_L_OFF, 360, y, 444, 1);
+                const char *value; size_t len;
+                if(ui_label_text(g_always_dash?UI_L_ON:UI_L_OFF,g_language,&value,&len))
+                    ui_draw_settings_value(value,len,y);
             } else if (i == 2) {
                 ui_draw_label(UI_L_BGM_VOLUME, 38, y, 300, 1);
-                ui_draw_value_number(g_bgm_volume, 382, y);
+                ui_draw_value_number(g_bgm_volume, y);
             } else if (i == 3) {
                 ui_draw_label(UI_L_SE_VOLUME, 38, y, 300, 1);
-                ui_draw_value_number(g_se_volume, 382, y);
+                ui_draw_value_number(g_se_volume, y);
             } else if (i == 4) {
                 ui_draw_label(UI_L_WINDOW_OPACITY, 38, y, 300, 1);
-                ui_draw_value_number(g_window_opacity, 382, y);
+                ui_draw_value_number(g_window_opacity, y);
+            } else if(i==5) {
+                draw_utf8_wrapped(save_delete_label(0),strlen(save_delete_label(0)),38,y,444,1);
             } else {
                 ui_draw_label(UI_L_BACK, 38, y, 444, 1);
             }
@@ -2540,11 +2682,12 @@ static void ui_options_scene(void)
             if (pressed & ui_ok_mask()) {
                 if (cursor == 0) delta = 1;
                 else if (cursor == 1) { g_always_dash = !g_always_dash; play_se_async(SE_UI_OK_PATH); }
-                else if (cursor == 5) { running = 0; play_se_async(SE_UI_CANCEL_PATH); }
+                else if (cursor == 5) { ui_confirm_delete_saves();sceCtrlPeekBufferPositive(&pad,1); }
+                else if (cursor == 6) { running = 0; play_se_async(SE_UI_CANCEL_PATH); }
             }
             if (delta) {
                 if (cursor == 0) {
-                    g_language = (g_language + (delta > 0 ? 1 : 3)) & 3;
+                    g_language = (g_language + (delta > 0 ? 1 : 4)) % 5;
                     save_config();
                     play_se_async(SE_UI_CURSOR_PATH);
                 } else if (cursor == 1) {
@@ -2599,6 +2742,8 @@ static void ui_format_playtime(uint32_t seconds, char *buf, size_t size)
              (unsigned int)h, (unsigned int)m, (unsigned int)s);
 }
 
+#include "runtime/save_previews.h"
+
 static int ui_save_load_scene(
     int saving,
     int current_map, int current_x, int current_y, int current_dir,
@@ -2610,13 +2755,15 @@ static int ui_save_load_scene(
     int scroll = 0;
     const int visible = 5;
 
-    if (saving && !g_save_enabled) return 0;
+    /* Direct Scene_Save calls from books remain available when the menu
+     * command is disabled, matching MZ SceneManager.push(Scene_Save). */
 
     /* The X press that opened Save/Load must never also activate File 1.
      * The slot screen is armed only after that physical press is released. */
     sceCtrlPeekBufferPositive(&pad, 1);
     prev = pad.Buttons;
 
+    clear_save_previews();
     while (1) {
         int i;
         if (cursor < scroll) scroll = cursor;
@@ -2639,9 +2786,9 @@ static int ui_save_load_scene(
         for (i = 0; i < visible; ++i) {
             int slot = scroll + i + 1;
             float y = 65.0f + i * 39.0f;
-            int map_id = 0, sx = 0, sy = 0;
+            int map_id = 0, sx = 0, sy = 0, actor = 1;
             uint32_t playtime = 0;
-            int exists = save_slot_metadata(slot, &map_id, &sx, &sy, &playtime);
+            int exists = save_slot_metadata(slot, &map_id, &sx, &sy, &playtime, &actor);
             char slot_text[32];
 
             if (slot - 1 == cursor)
@@ -2663,14 +2810,13 @@ static int ui_save_load_scene(
 
             if (exists) {
                 char time_text[32];
-                /* The original puts Enri's standing sprite in every occupied
-                 * slot.  Use the same runtime atlas rather than a placeholder. */
-                if (g_ui_char_atlas) {
-                    bind_texture_8888(g_ui_char_atlas, CHAR_ATLAS_W, CHAR_ATLAS_H);
+                void *preview=save_preview_texture(actor);
+                if(preview) {
+                    bind_texture_8888(preview,64,128);
                     set_pixel_art_texture_state();
-                    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-                    draw_bound_rect(CHAR_SLOT_W + 1, 1, CHAR_SRC_W, CHAR_SRC_H,
-                        142, y + 2, 32.0f * CHAR_SRC_W / CHAR_SRC_H, 32);
+                    sceGuTexFilter(GU_LINEAR,GU_LINEAR);
+                    draw_bound_rect(1,1,CHAR_SRC_W,CHAR_SRC_H,
+                        142,y+2,32.0f*CHAR_SRC_W/CHAR_SRC_H,32);
                     set_pixel_art_texture_state();
                 }
                 ui_format_playtime(playtime, time_text, sizeof(time_text));
@@ -2703,18 +2849,18 @@ static int ui_save_load_scene(
                 if (saving) {
                     if (save_to_slot(slot, current_map, current_x, current_y, current_dir)) {
                         play_se_async(SE_UI_SAVE_PATH);
-                        return 1;
+                        clear_save_previews(); return 1;
                     }
                 } else if (save_slot_exists(slot) && loaded && load_from_slot(slot, loaded)) {
                     play_se_async(SE_UI_LOAD_PATH);
-                    return 1;
+                    clear_save_previews(); return 1;
                 } else {
                     play_se_async(SE_UI_BUZZER_PATH);
                 }
             }
             if (pressed & ui_cancel_mask()) {
                 play_se_async(SE_UI_CANCEL_PATH);
-                return 0;
+                clear_save_previews(); return 0;
             }
         }
         prev = pad.Buttons;
@@ -2912,6 +3058,7 @@ static void free_map(MapState *m)
     if (m->event_atlas) free(m->event_atlas);
     if (m->event_atlas_detail) free(m->event_atlas_detail);
     if (m->vm_bin) free(m->vm_bin);
+    free(m->parallax_texture);
     memset(m, 0, sizeof(*m));
 }
 
@@ -2926,6 +3073,9 @@ static int load_map(MapState *m, int map_id)
 
     free_map(m);
     clear_event_routes();
+    g_balloon_frames = 0;
+    clear_stage_parallel();
+    g_stage_parallax_y=0;g_stage_parallax_scrolling=(map_id==54 || map_id==59 || (map_id==75 && !g_switches[763]));
     memset(g_event_shift_x, 0, sizeof(g_event_shift_x));
     memset(g_event_shift_y, 0, sizeof(g_event_shift_y));
     memset(g_event_move_speed, 0, sizeof(g_event_move_speed));
@@ -2953,6 +3103,7 @@ static int load_map(MapState *m, int map_id)
 
     cells = (size_t)m->w * (size_t)m->h;
     expected_map = MAP_HEADER_BYTES + cells * 4u * 2u + cells * 2u;
+    if (read_u16_le(m->map_bin + 16) & 1) expected_map += cells;
     if (m->map_size != expected_map) goto fail;
 
     {
@@ -3000,11 +3151,21 @@ static int load_map(MapState *m, int map_id)
         snprintf(path, sizeof(path), ASSET_ROOT "map%03d_event_atlas.rgba8888", map_id);
         m->event_atlas = load_exact_file(path, EVENT_ATLAS_BYTES);
         if (!m->event_atlas) goto fail;
-        if (map_id==32 || map_id==39 || map_id==40) {
+        int need_detail=map_id==32 || map_id==39 || map_id==40 || map_id==47;
+        {
+            for (i=0;i<m->sprite_count;++i)
+                if (read_u16_le(m->sprite_records+(size_t)i*SPRITE_RECORD_BYTES+4)>>12) need_detail=1;
+        }
+        if (need_detail) {
             snprintf(path,sizeof(path),ASSET_ROOT "map%03d_event_atlas1.rgba8888",map_id);
             m->event_atlas_detail=load_exact_file(path,EVENT_ATLAS_BYTES);
             if(!m->event_atlas_detail)goto fail;
         }
+    }
+
+    if (map_id==54 || map_id==59 || map_id==61 || map_id==75) {
+        m->parallax_texture=load_exact_file(ASSET_ROOT "parallax_chain.rgba8888",EVENT_ATLAS_BYTES);
+        if (!m->parallax_texture) goto fail;
     }
 
     snprintf(path, sizeof(path), ASSET_ROOT "map%03d_vm.bin", map_id);
@@ -3042,6 +3203,8 @@ static uint16_t map_word(const MapState *m, int z, int x, int y)
     return read_u16_le(m->map_bin + MAP_HEADER_BYTES + cell * 2);
 }
 
+static uint8_t event_tile_pass_mask(const MapState *m,int x,int y,uint8_t fallback);
+
 static uint8_t pass_mask_at(const MapState *m, int x, int y)
 {
     size_t cells;
@@ -3049,7 +3212,18 @@ static uint8_t pass_mask_at(const MapState *m, int x, int y)
     if (x < 0 || y < 0 || x >= m->w || y >= m->h) return 0;
     cells = (size_t)m->w * (size_t)m->h;
     pass_offset = MAP_HEADER_BYTES + cells * 4u * 2u;
-    return m->map_bin[pass_offset + (size_t)y * m->w + x];
+    uint8_t mask=m->map_bin[pass_offset + (size_t)y * m->w + x];
+    return (m->vm_flags&2) ? event_tile_pass_mask(m,x,y,mask) : mask;
+}
+
+/* Original tileset counter flag permits one action check beyond a counter. */
+static int counter_at(const MapState *m, int x, int y)
+{
+    size_t cells;
+    if (!m->map_bin || x < 0 || y < 0 || x >= m->w || y >= m->h ||
+        !(read_u16_le(m->map_bin + 16) & 1)) return 0;
+    cells = (size_t)m->w * m->h;
+    return m->map_bin[MAP_HEADER_BYTES + cells * 10u + (size_t)y * m->w + x] != 0;
 }
 
 static uint16_t action_event_at(const MapState *m, int x, int y)
@@ -3196,11 +3370,17 @@ static int is_chase_enemy(int map_id,int id)
 {
     return ((map_id==24 || map_id==25) && id==3) ||
            (map_id==32 && id==23) || (map_id==33 && id==46) ||
-           (map_id==34 && id==51);
+           (map_id==34 && id==51) || (map_id==49 && id==28) ||
+           (map_id==50 && id==10) || (map_id==51 && id==4) ||
+           (map_id==52 && id==5) || (map_id==53 && id==15) || (map_id==95 && (id==3 || id==4 || id==6 || id==7 || id==9));
+}
+static int is_spider_enemy(int map_id,int id)
+{
+    return (map_id==67 && id>=1 && id<=4) || (map_id==68 && id==2);
 }
 static int is_chase_map(int map_id)
 {
-    return map_id==24 || map_id==25 || (map_id>=32 && map_id<=34);
+    return map_id==24 || map_id==25 || (map_id>=32 && map_id<=34) || (map_id>=49 && map_id<=53) || map_id==67 || map_id==68 || map_id==69 || map_id==72 || map_id==95;
 }
 
 static void vm_event_contact_cell(const MapState *m, const VmEventRecord *ev, int *x, int *y)
@@ -3208,7 +3388,11 @@ static void vm_event_contact_cell(const MapState *m, const VmEventRecord *ev, in
     int id=ev->event_id;
     *x=ev->x; *y=ev->y;
     if(id<0 || id>=MAX_EVENT_ID) return;
-    if(is_chase_enemy(m->id,id)) {
+    /* MZ commits a moving event's logical cell at step start. In the
+     * dealer scene, trailing actors must enter the cell already vacated by
+     * the leader, even while its sprite is still interpolating out of it. */
+    if(is_chase_enemy(m->id,id) || is_spider_enemy(m->id,id) || m->id==69 || m->id==72 ||
+       (m->id==94 && g_routes[id].records && g_routes[id].remaining>0)) {
         const EventRoute *r=&g_routes[id];
         float sx=g_event_shift_x[id], sy=g_event_shift_y[id];
         if(r->records && r->remaining>0) {sx=r->start_x+r->dx;sy=r->start_y+r->dy;}
@@ -3233,7 +3417,8 @@ static int vm_find_event_at(
         {
             int cell_x,cell_y;
             vm_event_contact_cell(m,&ev,&cell_x,&cell_y);
-            if(cell_x!=x || cell_y!=y) continue;
+            if((cell_x!=x || cell_y!=y) &&
+               !(trigger==1 && spider_entrance_contact(m->id,ev.event_id,x,y,m->w))) continue;
         }
         if (!vm_active_page(m, &ev, &pg)) continue;
         if (!pg.supported || pg.cmd_size <= 1) continue;
@@ -3242,9 +3427,13 @@ static int vm_find_event_at(
         if (trigger == -2 || trigger == -3) {
             /* MZ action: current cell below/above actors, front cell normal
              * priority. Empty pages cannot set Game_Event._starting. */
-            if(pg.trigger!=0 || (trigger==-2 ? pg.priority==1 : pg.priority!=1))continue;
+            /* MZ checkEventTriggerHere([0]), checkEventTriggerThere([0,1,2]).
+             * Invisible normal-priority Touch doors also accept action input. */
+            if(trigger==-2) {
+                if(pg.trigger!=0 || pg.priority==1)continue;
+            } else if(pg.trigger>2 || pg.priority!=1)continue;
         } else if (trigger < 0) {
-            if (pg.trigger != 1 || pg.priority != 1) continue;
+            if ((pg.trigger != 1 && !(((m->id>=80 && m->id<=104) || (m->id>=111 && m->id<=139)) && pg.trigger==2)) || pg.priority != 1) continue;
         } else if (pg.trigger != trigger) continue;
         if (ev_out) *ev_out = ev;
         if (page_out) *page_out = pg;
@@ -3319,6 +3508,8 @@ static int vm_touch_transfer_at(const MapState *m, int x, int y)
 /* World rendering                                                           */
 /* ------------------------------------------------------------------------- */
 
+#include "runtime/event_tile_passage.h"
+
 static void vm_begin_map_scroll(int direction,int distance,int speed)
 {
     if(speed<1)speed=1;
@@ -3363,6 +3554,13 @@ static void compute_camera(
         max_x = 0.0f;
     }
 
+    /* These cinematic maps stage their actors in the right-hand part of
+     * the source map. Frame the action rather than Will's offscreen position. */
+    if (m->id == 98 || m->id == 99) {
+        *origin_x = SCREEN_W * 0.5f - (m->id == 98 ? 13.5f : 15.5f) * TILE_PX;
+        if (m->id == 98) *origin_x += TILE_PX; /* Keep the rooftop shot right of centre. */
+    }
+
     if (g_camera_locked) {
         *camera_x = clamp_float(g_camera_lock_x + g_camera_scroll_x, 0.0f, max_x);
         *camera_y = clamp_float(g_camera_lock_y + g_camera_scroll_y, 0.0f, max_y);
@@ -3375,6 +3573,15 @@ static void compute_camera(
     *camera_y = max_y > 0.0f
         ? clamp_float(player_y - SCREEN_H * 0.5f + g_camera_scroll_y, 0.0f, max_y)
         : 0.0f;
+
+    /* Map 098 starts with hidden Will at the bottom map boundary. Scroll
+     * from the bounded initial viewport, not his offscreen centre: otherwise
+     * the 10-tile pan leaves the rooftop actor clipped at the top edge. */
+    if (m->id == 98 && !g_camera_locked)
+        /* The visible roof starts at source row 6. Stop the upward pan
+         * there instead of exposing the map's empty upper margin. */
+        *camera_y = clamp_float(clamp_float(player_y - SCREEN_H * 0.5f,
+            0.0f, max_y) + g_camera_scroll_y, 6.0f * TILE_PX, max_y);
 
 }
 
@@ -3480,6 +3687,21 @@ static void draw_map_pass(
 
 /* Crowded source sheets use one detail page, freed on map transfer. */
 static void *g_event_texture_base,*g_event_texture_detail,*g_event_texture_bound;
+static unsigned int g_ambush_reveal_start;
+static int g_ambush_reveal_started;
+
+/* Short visual reveal only; the original route and collision stay active. */
+static int ambush_reveal_opacity(int map_id, int event_id, unsigned int frame)
+{
+    unsigned int age;
+    if (map_id != 34 || event_id != 51) return 255;
+    if (!g_ambush_reveal_started) {
+        g_ambush_reveal_started = 1;
+        g_ambush_reveal_start = frame;
+    }
+    age = frame - g_ambush_reveal_start;
+    return age >= 6 ? 255 : (int)((age + 1) * 255 / 7);
+}
 
 static void draw_event_sprite_record(
     const EventSpriteRecord *sp, int map_id,
@@ -3492,10 +3714,10 @@ static void draw_event_sprite_record(
     /* At native PSP scale the slow fall moves only 0.375 px/frame.
      * Preserve its fractional position with isolated high-resolution frames;
      * all other pixel-art sprites keep their established integer alignment. */
-    int smooth_fall = (map_id == 1 && sp->event_id == 5 && g_routes[5].remaining > 0) ||
+    int smooth_fall = (map_id == 109 && sp->event_id == 3) || (map_id == 1 && sp->event_id == 5 && g_routes[5].remaining > 0) ||
                       (map_id == 16 && sp->event_id == 36) ||
                       (map_id == 12 && (sp->flags & 0x04)) || (map_id == 30 && (sp->flags & 0x04)) || (map_id == 39 && (sp->flags & 0x04)) ||
-                      is_chase_enemy(map_id,sp->event_id) || (map_id==32 && sp->event_id==19);
+                      is_chase_enemy(map_id,sp->event_id) || is_spider_enemy(map_id,sp->event_id) || (map_id==32 && sp->event_id==19) || ((map_id==69 || map_id==72 || map_id==78) && g_routes[sp->event_id].remaining>0);
     if ((map_id == 1 && sp->event_id == 5) || (map_id == 16 && sp->event_id == 36)) {
         camera_x = g_actor_camera_x;
         camera_y = g_actor_camera_y;
@@ -3516,10 +3738,10 @@ static void draw_event_sprite_record(
     float src_y = (float)sp->sy;
     if((sp->flags&0x40) && sp->event_id>=0 && sp->event_id<MAX_EVENT_ID && g_event_direction[sp->event_id]>=0) {
         int row=g_event_direction[sp->event_id];
-        if ((is_chase_enemy(map_id,sp->event_id) || (map_id==27 && sp->event_id==1) || (map_id==35 && sp->event_id==7) || (map_id==36 && sp->event_id==16) || map_id==39) && (sp->flags&0x84)==0x84) {
+        if ((sp->flags & 0xC4) == 0xC4 && map_id!=94) {
             src_x+=(row&1)*3*sp->sw;
             src_y+=(row>>1)*sp->sh;
-        } else if(map_id==43 && (sp->flags&4)) {
+        } else if((map_id==43 || (((map_id>=48 && map_id<=104) || (map_id>=111 && map_id<=139)) || map_id==115)) && (sp->flags&4) && !(sp->flags&0x80)) {
             src_x+=(row&1)*sp->sw;src_y+=(row>>1)*sp->sh;
         } else src_y+=row*sp->sh;
     }
@@ -3548,7 +3770,10 @@ static void draw_event_sprite_record(
             int steps=(int)((x<0?-x:x)+(y<0?-y:y));
             pattern=gait[steps&3];
         }
-        src_x += pattern * sp->sw;
+        if(map_id==72 && id==2 && !(sp->flags&0x40)) {
+            /* Giant spider: three native poses in a 2x2 atlas block. */
+            src_x+=(pattern&1)*sp->sw;src_y+=(pattern>>1)*sp->sh;
+        } else src_x += pattern * sp->sw;
     }
     if (sp->flags & 0x02) {
         static const int sequence[4] = {1, 2, 1, 0};
@@ -3568,7 +3793,7 @@ static void draw_event_sprite_record(
      * linear filtering preserves the tiny monitor lettering much better than
      * throwing away every other pixel during conversion. */
     if (sp->flags & 0x04) {
-        float scale = (((map_id==21 || map_id==23 || map_id==27) && sp->sw==36 && sp->sh==144) || ((map_id==27 || (map_id>=32 && map_id<=39)) && sp->sw==54 && sp->sh==108) || (map_id==40 && sp->sw==108 && sp->sh==324)) ? (2.0f/3.0f) : 0.5f;
+        float scale = (((map_id==21 || map_id==23 || map_id==27) && sp->sw==36 && sp->sh==144) || ((map_id==27 || (((map_id>=32 && map_id<=104) || (map_id>=111 && map_id<=139)) || map_id==115)) && sp->sw==54 && sp->sh==108) || (map_id==40 && sp->sw==108 && sp->sh==324)) ? (2.0f/3.0f) : 0.5f;
         dst_w *= scale;
         dst_h *= scale;
         sceGuTexFilter(GU_LINEAR, GU_LINEAR);
@@ -3576,15 +3801,30 @@ static void draw_event_sprite_record(
         sceGuTexFilter(GU_NEAREST, GU_NEAREST);
     }
 
-    if((map_id==33 || map_id==34) && sp->sw==144 && sp->sh==96)
-        sceGuTexFilter(GU_NEAREST,GU_NEAREST);
 
     if (map_id == 16 || ((map_id == 24 || map_id == 25) && sp->event_id == 3))
         sceGuTexFilter(GU_LINEAR, GU_LINEAR);
 
-    if(sp->event_id>=0 && sp->event_id<MAX_EVENT_ID && g_event_opacity[sp->event_id]!=255) {
-        sceGuTexFunc(GU_TFX_MODULATE,GU_TCC_RGBA);
-        sceGuColor(((unsigned int)g_event_opacity[sp->event_id]<<24)|0xFFFFFFu);
+    {
+        int opacity = ambush_reveal_opacity(map_id, sp->event_id, g_world_render_frames);
+        /* The rooftop withdrawal finishes on the last right-hand tile.
+         * Hide its actor at that endpoint while the original fade continues. */
+        if (map_id == 98 && sp->event_id == 1 &&
+            sp->x + g_event_shift_x[1] >= 17.0f)
+            opacity = 0;
+
+        /* Dealers leave the cinematic frame at the original viewport edge.
+         * Keep their forced routes intact; this affects only presentation. */
+        if (map_id == 94 && (sp->event_id == 11 || sp->event_id == 12)) {
+            float cell_x = sp->x + g_event_shift_x[sp->event_id];
+            if (cell_x > 17.0f) opacity = (int)(opacity * clamp_float(18.0f-cell_x,0.0f,1.0f));
+        }
+        if (sp->event_id >= 0 && sp->event_id < MAX_EVENT_ID)
+            opacity = opacity * g_event_opacity[sp->event_id] / 255;
+        if (opacity != 255) {
+            sceGuTexFunc(GU_TFX_MODULATE, GU_TCC_RGBA);
+            sceGuColor(((unsigned int)opacity << 24) | 0xFFFFFFu);
+        }
     }
     draw_bound_rect(
         src_x, src_y, (float)sp->sw, (float)sp->sh,
@@ -3612,6 +3852,7 @@ static void draw_tentacle_room_sprites(
     EventSpriteRecord sprites[MAX_EVENT_ID];
     float ys[MAX_EVENT_ID];
     int count=0,i;
+    const float player_sort_y=player_y-3.0f;
     for(i=0;i<m->vm_event_count && count<MAX_EVENT_ID;++i) {
         VmEventRecord ev;VmPageRecord pg;EventSpriteRecord sp;
         int active,j;float y;
@@ -3631,7 +3872,8 @@ static void draw_tentacle_room_sprites(
         }
         y=(ev.y+1.0f+(ev.event_id<MAX_EVENT_ID?g_event_shift_y[ev.event_id]:0))*TILE_PX;
         if(ev.event_id>=0 && ev.event_id<MAX_EVENT_ID)y-=g_event_jump_height[ev.event_id];
-        if(priority==1 && ((side<0 && y>player_y)||(side>0 && y<=player_y))) continue;
+        y-=(sp.flags&1)?0.0f:3.0f;
+        if(priority==1 && ((side<0 && y>=player_sort_y)||(side>0 && y<player_sort_y))) continue;
         j=count;
         while(j>0 && (ys[j-1]>y || (ys[j-1]==y && sprites[j-1].event_id>sp.event_id))) {
             sprites[j]=sprites[j-1];ys[j]=ys[j-1];--j;
@@ -3653,7 +3895,7 @@ static void draw_event_sprites(
     g_event_texture_base=m->event_atlas;g_event_texture_detail=m->event_atlas_detail;
     bind_texture_8888(m->event_atlas, EVENT_ATLAS_W, EVENT_ATLAS_H);
     g_event_texture_bound=m->event_atlas;
-    if((m->id==16 || m->id==30 || (m->id>=32 && m->id<=45)) && (m->vm_flags&1) && m->vm_bin) {
+    if((m->id==16 || m->id==30 || (((m->id>=32 && m->id<=104) || (m->id>=111 && m->id<=139)) || m->id==115)) && (m->vm_flags&1) && m->vm_bin) {
         draw_tentacle_room_sprites(m,priority,side_of_player,player_world_y,
                                   camera_x,camera_y,origin_x,origin_y);
         return;
@@ -3675,7 +3917,7 @@ static void draw_event_sprites(
             if (!vm_read_event(m, i, &ev)) continue;
             if (g_key_anim && is_dedicated_story_key_event(m->id, ev.event_id)) continue;
             if (!vm_active_page_index(m, &ev, &pg, &active_index)) continue;
-            if ((m->id == 12 || m->id == 24 || m->id == 25 || m->id == 27 || m->id == 30 || (m->id >= 32 && m->id <= 45)) && ev.event_id > 0 && ev.event_id < MAX_EVENT_ID &&
+            if ((m->id == 12 || m->id == 24 || m->id == 25 || m->id == 27 || m->id == 30 || (m->id >= 32 && m->id <= 55)) && ev.event_id > 0 && ev.event_id < MAX_EVENT_ID &&
                 g_event_active_page[ev.event_id] != active_index) {
                 g_event_active_page[ev.event_id] = active_index;
                 g_event_direction[ev.event_id] = (pg.flags >> 5) & 3;
@@ -3815,6 +4057,8 @@ static void picture_show(int number, int resource_id, int origin,
     slot = picture_slot(number);
     if (!slot) return; /* PSP-1000 memory cap: max five pictures */
     snprintf(path, sizeof(path), ASSET_ROOT "pic_%03d.p44", resource_id);
+    if(g_language==4 && resource_id>=9 && resource_id<=12)
+        snprintf(path,sizeof(path),ASSET_ROOT "controls_ru177.p44");
     fp = fopen(path,"rb");
     if (!fp) return;
     if (fread(header,1,8,fp) != 8 ||
@@ -3908,8 +4152,11 @@ static void draw_fog_a1_overlay(int effect_active)
         g_fog_scroll -= 512.0f;
 }
 
+#include "runtime/laser_chase_trail.h"
+
 static void clear_event_routes(void)
 {
+    laser_chase_reset();
     g_s003_paused = 0;
     memset(g_factory_page,0,sizeof(g_factory_page));
     g_factory_machine_frame=g_factory_corpse_phase=0;
@@ -3917,6 +4164,7 @@ static void clear_event_routes(void)
     g_laser_room_frame = g_laser_stop_count = g_laser_route_index = 0;
     int i;
     free(g_player_route.records);memset(&g_player_route,0,sizeof(g_player_route));
+    g_ambush_reveal_started = 0;
     for(i=0;i<MAX_EVENT_ID;++i) {
         free(g_routes[i].records);memset(&g_routes[i],0,sizeof(EventRoute));
         g_event_jump_height[i]=0;g_event_opacity[i]=255;g_event_through[i]=0;g_event_direction[i]=-1;g_event_direction_fix[i]=0;g_event_erased[i]=0;
@@ -3938,6 +4186,8 @@ static int g_s003_player_x, g_s003_player_y;
 static void tick_event_routes(const MapState *m)
 {
     int id;
+    if(m->id==32 && !g_s003_paused)
+        laser_chase_record(g_s003_player_x,g_s003_player_y);
     for(id=1;id<MAX_EVENT_ID;++id) {
         EventRoute *r=&g_routes[id];
         int budget=128;
@@ -3987,6 +4237,7 @@ static void tick_event_routes(const MapState *m)
                 int y=r->base_y+(int)(g_event_shift_y[id]+(g_event_shift_y[id]<0?-.5f:.5f));
                 int dx=g_s003_player_x-x, dy=g_s003_player_y-y;
                 int secondary;
+                int trail_code=(m->id==32 && id==23) ? laser_chase_step(x,y) : -1;
                 if (abs(dx)>abs(dy)) {
                     code=dx>0?3:2; secondary=dy>0?1:(dy<0?4:0);
                 } else {
@@ -3994,9 +4245,16 @@ static void tick_event_routes(const MapState *m)
                 }
                 if (code && !g_event_through[id] && !event_route_can_step(m,id,x,y,code) &&
                     secondary && event_route_can_step(m,id,x,y,secondary)) code=secondary;
+                if(trail_code>=0)code=trail_code;
             }
             if(code==13)code=4-g_event_direction[id];
-            if(code==29)g_event_move_speed[id]=n<1?1:(n>6?6:n);
+            if(code==29) {
+                g_event_move_speed[id]=n<1?1:(n>6?6:n);
+                /* MZ processMoveCommand uses one update for a speed change.
+                 * The giant-spider route alternates 5/6; consuming the next
+                 * move in this same update shortened every chase cycle. */
+                if(m->id==72)break;
+            }
             else if(code>=16 && code<=19) {
                 if(!g_event_direction_fix[id])g_event_direction[id]=code-16;
                 /* MZ updates these rotating sensors once per frame. Consuming
@@ -4023,19 +4281,23 @@ static void tick_event_routes(const MapState *m)
                     if(!(pass_mask_at(m,x,y)&bit) || !(pass_mask_at(m,nx,ny)&reverse) || vm_event_blocks_except(m,nx,ny,id)) {
                         r->dx=r->dy=0;
                         if (!(r->flags & 2)) {
-                            /* One record per blocked command, not every frame. */
-                            static int last_map = -1, last_id = -1, last_index = -1;
-                            if (last_map != m->id || last_id != id || last_index != r->index) {
-                                FILE *log = fopen(g_scene_trace_path, "a");
-                                if (log) {
-                                    fprintf(log, "map=%d event=%d step=%d code=%d from=%d,%d to=%d,%d pass=%d reverse=%d event_block=%d\n",
-                                            m->id,id,r->index,p[0],x,y,nx,ny,
-                                            pass_mask_at(m,x,y)&bit,pass_mask_at(m,nx,ny)&reverse,
-                                            vm_event_blocks_except(m,nx,ny,id));
+#ifdef NARAKU_ROUTE_TRACE
+                            /* Debug only: independent actors must not invalidate
+                             * each other's blocked-command deduplication. */
+                            static int last_map = -1;
+                            static int last_index[MAX_EVENT_ID];
+                            if (last_map != m->id) {
+                                memset(last_index,0,sizeof(last_index));last_map=m->id;
+                            }
+                            if (last_index[id] != r->index) {
+                                FILE *log=fopen(g_scene_trace_path,"a");
+                                if(log) {
+                                    fprintf(log,"map=%d event=%d blocked step=%d\n",m->id,id,r->index);
                                     fclose(log);
                                 }
-                                last_map=m->id;last_id=id;last_index=r->index;
+                                last_index[id]=r->index;
                             }
+#endif
                             --r->index;
                         }
                         break;
@@ -4045,6 +4307,13 @@ static void tick_event_routes(const MapState *m)
                     g_event_direction[id]=code-1;
                 r->start_x=g_event_shift_x[id];r->start_y=g_event_shift_y[id];
                 r->total=code==15?n:(256/(1<<(speed>0?speed:3)));
+                /* Only the final approach to the Ending 6 meeting: gradually
+                 * give Will a small lead before pursuers leave the next scene. */
+                if (m->id == 95 && g_switches[939] && g_factory_page[id] &&
+                    is_chase_enemy(95,id) && code!=15 &&
+                    g_s003_player_y>=12 && g_s003_player_y<=16 &&
+                    g_s003_player_x>=1 && g_s003_player_x<9)
+                    r->total += r->total * (9-g_s003_player_x) / 16;
                 r->remaining=r->total;
                 if(r->remaining>0) {
                     g_event_shift_x[id]+= (float)r->dx/r->total;
@@ -4066,9 +4335,18 @@ static void tick_event_routes(const MapState *m)
 
 static int start_event_route(const MapState *m,int id,const uint8_t *records,int count,int flags)
 {
-    EventRoute *r; int i;
+    EventRoute *r, pending; int i, carry_step;
     if(id<1 || id>=MAX_EVENT_ID || count<=0)return 0;
-    r=&g_routes[id];free(r->records);memset(r,0,sizeof(*r));g_event_jump_height[id]=0;
+    r=&g_routes[id];pending=*r;
+    carry_step=m->id==94 && pending.records && pending.remaining>0;
+    free(r->records);memset(r,0,sizeof(*r));
+    if(carry_step) {
+        /* forceMoveRoute replaces commands, not a step already in flight. */
+        r->start_x=pending.start_x;r->start_y=pending.start_y;
+        r->dx=pending.dx;r->dy=pending.dy;
+        r->total=pending.total;r->remaining=pending.remaining;
+        r->jump_peak=pending.jump_peak;
+    } else g_event_jump_height[id]=0;
     r->records=malloc(count*5);if(!r->records)return 0;
     memcpy(r->records,records,count*5);r->count=count;r->flags=flags;
     for(i=0;i<m->vm_event_count;++i) {
@@ -4113,7 +4391,7 @@ static void tick_s003_autonomous(const MapState *m, float player_x, float player
 static void tick_factory_autonomous(const MapState *m)
 {
     unsigned int i;
-    if((m->id<32 || m->id>34) && m->id!=43)return;
+    if((m->id<32 || m->id>34) && m->id!=43 && (m->id<48 || m->id>55) && m->id!=67 && m->id!=68 && m->id!=72 && m->id!=95 && m->id!=120)return;
     if(g_s003_paused)return;
     for(i=0;i<sizeof(factory_routes)/sizeof(factory_routes[0]);++i) {
         const FactoryRoute *fr=&factory_routes[i];
@@ -4258,7 +4536,7 @@ static void move_picture_start(PictureSlot *p,int origin,int x,int y,int zx,int 
     /* MZ duration=0 records a target without running updateMove. */
 }
 
-static void draw_vm_pictures(int below_a1)
+static void draw_vm_pictures(int below_a1, int gallery)
 {
     int i,j,order[MAX_ACTIVE_PICTURES];
     for(i=0;i<MAX_ACTIVE_PICTURES;++i)order[i]=i;
@@ -4274,7 +4552,7 @@ static void draw_vm_pictures(int below_a1)
         w=(float)p->w * p->scale_x / 100.0f;
         h=(float)p->h * p->scale_y / 100.0f;
         {
-            int fit_screen = p->fit_screen ||
+            int fit_screen = gallery || p->fit_screen ||
                 (p->resource_id >= 90 && p->resource_id <= 97) ||
                 (!p->portrait && p->number == 11 && p->w == 408 && p->h == 312);
             if (p->resource_id >= 90 && p->resource_id <= 97) {
@@ -4297,11 +4575,21 @@ static void draw_vm_pictures(int below_a1)
             y=render_round_pixel(y);
             }
         }
+        /* Cover fractional rasterisation gaps under Finish A1 as well as
+         * its side fields. The texture also carries a replicated edge texel. */
+        if (p->resource_id==104 && p->fit_screen) {
+            sceGuBlendFunc(GU_ADD,GU_SRC_ALPHA,GU_ONE_MINUS_SRC_ALPHA,0,0);
+            draw_solid_rect(0,0,SCREEN_W,SCREEN_H,255,255,255,(int)p->opacity);
+        }
+        if (gallery) draw_solid_rect(0,0,SCREEN_W,SCREEN_H,0,0,0,(int)p->opacity);
+        if (!p->portrait && ((p->number == 11 && p->w == 408 && p->h == 312) ||
+                              (p->resource_id >= 99 && p->resource_id <= 103)))
+            draw_solid_rect(0,0,SCREEN_W,SCREEN_H,0,0,0,(int)p->opacity);
         sceGuTexMode(GU_PSM_4444,0,0,GU_FALSE);
         sceGuTexImage(0,512,512,512,p->texture);
         sceGuTexFunc(GU_TFX_MODULATE,GU_TCC_RGBA);
         {
-            int fit_filter = p->portrait || p->fit_screen ||
+            int fit_filter = gallery || p->portrait || p->fit_screen ||
                 (p->resource_id >= 90 && p->resource_id <= 97) ||
                 (!p->portrait && p->number == 11 && p->w == 408 && p->h == 312);
             sceGuTexFilter(fit_filter ? GU_LINEAR : GU_NEAREST,
@@ -4313,7 +4601,7 @@ static void draw_vm_pictures(int below_a1)
         else sceGuBlendFunc(GU_ADD,GU_SRC_ALPHA,GU_ONE_MINUS_SRC_ALPHA,0,0);
         sceGuColor(((unsigned int)p->opacity<<24)|0x00FFFFFFu);
         if(p->portrait) {
-            float zx=p->scale_x/100.0f,zy=p->scale_y/100.0f;
+            float zx=gallery?w/p->w:p->scale_x/100.0f,zy=gallery?h/p->h:p->scale_y/100.0f;
             draw_bound_rect(1,1,p->source_w,p->source_h,
                 x+p->picture_offset_x*zx,y+p->picture_offset_y*zy,
                 p->picture_region_w*zx,p->picture_region_h*zy);
@@ -4517,6 +4805,12 @@ static void tick_factory_parallel(const MapState *m)
     }
 }
 
+#include "runtime/stage_parallel.h"
+
+static const char *g_scroll_text;
+static size_t g_scroll_text_len;
+static float g_scroll_text_y;
+
 static void render_world(
     const MapState *m, void *char_atlas,
     void *a1_overlay, void *fall_atlas,
@@ -4554,6 +4848,7 @@ static void render_world(
     }
     g_player_animation_moving = g_player_animation_jumping = 0;
     repair_map005_key_state(m);
+    reconcile_consumed_items();
 
     tick_map_scroll();
     compute_camera(
@@ -4577,6 +4872,12 @@ static void render_world(
     /* Spriteset_Base.updatePosition(): Math.round(screen.shake()). */
     origin_x += render_round_pixel(g_screen_shake_x);
 
+    /* Map 096: Will's original run ends on the last right-hand tile while
+     * the interpreter continues the pursuers' scene. Treat that endpoint as
+     * an exit from the cinematic frame, without changing party visibility. */
+    if (m->id == 96 && player_world_x >= ((float)m->w - 0.5f) * TILE_PX)
+        player_visible = 0;
+
     player_screen_x = origin_x + player_world_x - actor_camera_x;
     player_screen_y = origin_y + player_world_y - actor_camera_y;
     if (m->id == 1 && !subpixel_jump) {
@@ -4591,6 +4892,7 @@ static void render_world(
     tick_factory_autonomous(m);
     tick_event_routes(m);
     tick_factory_parallel(m);
+    tick_stage_parallel(m);
     vm_tick_world_tint();
     sceGuStart(GU_DIRECT, gu_list);
     sceGuClearColor(0xFF000000);
@@ -4600,6 +4902,18 @@ static void render_world(
      * canonical nearest/clamped state so a dialogue transition cannot expose
      * one LINEAR-filtered world frame. */
     set_pixel_art_texture_state();
+    if (m->parallax_texture) {
+        bind_texture_8888(m->parallax_texture,512,512);
+        sceGuTexFilter(GU_LINEAR,GU_LINEAR);
+        draw_bound_rect(0,0,408,312,36,g_stage_parallax_y,408,312);
+        if (g_stage_parallax_scrolling) {
+            draw_bound_rect(0,0,408,312,36,g_stage_parallax_y-312,408,312);
+            /* Original Sy=-10 advances the displayed panorama by 1.25 PSP pixels. */
+            g_stage_parallax_y+=1.25f;
+            if (g_stage_parallax_y>=312) g_stage_parallax_y-=312;
+        }
+        set_pixel_art_texture_state();
+    }
     draw_map_pass(m, 0, camera_x, camera_y, origin_x, origin_y);
 
     draw_event_sprites(
@@ -4623,13 +4937,23 @@ static void render_world(
                               -1, player_world_y);
 
     if (player_visible) {
-        bind_texture_8888(char_atlas, CHAR_ATLAS_W, CHAR_ATLAS_H);
+        bind_texture_8888(player_form_texture(char_atlas), CHAR_ATLAS_W, CHAR_ATLAS_H);
         set_pixel_art_texture_state();
         sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+        int secret_ladder_top=secret_ladder_clip_top(m->id,player_world_x,player_world_y,
+                                                   TILE_PX,origin_y,actor_camera_y,SCREEN_H);
+        if(secret_ladder_top>=0)sceGuScissor(0,secret_ladder_top,SCREEN_W,SCREEN_H);
+        int player_opacity=cinematic_player_opacity(m->id,player_world_x,TILE_PX);
+        if(player_opacity<255) {
+            sceGuTexFunc(GU_TFX_MODULATE,GU_TCC_RGBA);
+            sceGuColor(((unsigned int)player_opacity<<24)|0xFFFFFFu);
+        }
         draw_character_frame(
             player_pattern, player_direction,
             player_screen_x, player_screen_y
         );
+        if(secret_ladder_top>=0)sceGuScissor(0,0,SCREEN_W,SCREEN_H);
+        if(player_opacity<255)sceGuColor(0xFFFFFFFF);
         set_pixel_art_texture_state();
     }
 
@@ -4646,6 +4970,30 @@ static void render_world(
         m, 2, 0, player_world_y,
         camera_x, camera_y, origin_x, origin_y
     );
+
+    if (g_balloon_frames > 0 && g_balloon_atlas) {
+        float bx=player_screen_x, by=player_screen_y-39.0f;
+        int visible=player_visible, i;
+        if (g_balloon_target >= 0) {
+            visible=0;
+            for(i=0;i<m->vm_event_count;++i) {
+                VmEventRecord ev;
+                if(vm_read_event(m,i,&ev) && ev.event_id==g_balloon_target && ev.event_id<MAX_EVENT_ID) {
+                    bx=origin_x+(ev.x+g_event_shift_x[ev.event_id]+0.5f)*TILE_PX-actor_camera_x;
+                    by=origin_y+(ev.y+g_event_shift_y[ev.event_id]+1.0f)*TILE_PX-actor_camera_y-39.0f;
+                    visible=1;break;
+                }
+            }
+        }
+        if(visible) {
+            int frame=(76-g_balloon_frames)/8;if(frame>7)frame=7;
+            bind_texture_8888(g_balloon_atlas,512,512);
+            sceGuTexFilter(GU_LINEAR,GU_LINEAR);
+            draw_bound_rect(frame*50+1,(g_balloon_id-1)*50+1,48,48,bx-12,by-24,24,24);
+            set_pixel_art_texture_state();
+        }
+        --g_balloon_frames;
+    }
 
     /* 0.5.x atlases omitted switch-driven Lucas pages; keep the old fallback
      * only for legacy assets.  0.6.4 renders them through active VM pages. */
@@ -4687,7 +5035,7 @@ static void render_world(
         sceGuBlendFunc(GU_ADD,GU_SRC_ALPHA,GU_ONE_MINUS_SRC_ALPHA,0,0);
     }
 
-    draw_vm_pictures(1);
+    draw_vm_pictures(1, m->id==114);
     {
         int veil_active = (a1_overlay != NULL) || g_picture6_visible || g_switches[20];
 
@@ -4724,7 +5072,8 @@ static void render_world(
         draw_fog_a1_overlay(veil_active);
     }
 
-    draw_vm_pictures(0);
+    draw_vm_pictures(0, m->id==114);
+    if (g_scroll_text) draw_utf8_wrapped(g_scroll_text,g_scroll_text_len,36,g_scroll_text_y,444,512);
 
     if (portrait) {
         draw_texture_alpha(
@@ -4906,11 +5255,18 @@ static int vm_text_has_visible_content(const char *text, size_t len)
     return 0;
 }
 
+static const MapState *g_vm_position_owner;
+static int *g_vm_tile_x, *g_vm_tile_y, *g_vm_direction;
+static void vm_pump_stage_message(const MapState *m, void *char_atlas, int x, int y, int direction);
+
 static void vm_render_frame(
     const MapState *m, void *char_atlas,
     int tile_x, int tile_y, int direction_row,
     int black_alpha, int red_alpha)
 {
+    if (g_vm_position_owner==m && g_vm_tile_x && g_vm_tile_y && g_vm_direction) {
+        tile_x=*g_vm_tile_x;tile_y=*g_vm_tile_y;direction_row=*g_vm_direction;
+    }
     float wx = ((float)tile_x + 0.5f) * TILE_PX;
     float wy = ((float)tile_y + 1.0f) * TILE_PX;
     g_player_animation_speed = clamp_move_speed_code(g_player_move_speed_code);
@@ -4919,6 +5275,7 @@ static void vm_render_frame(
         g_player_visible, wx, wy, 1, direction_row,
         -1, 0.0f, NULL, NULL, red_alpha, black_alpha, 0
     );
+    vm_pump_stage_message(m,char_atlas,tile_x,tile_y,direction_row);
 }
 
 static void vm_wait_frames(
@@ -5090,6 +5447,26 @@ static void vm_wait_text_page(
     free(styled);
 }
 
+/* PC font-size directives are metadata. Strip before measuring words so old
+ * installed resources and restored emulator states cannot print them either. */
+static char *strip_message_font_controls(const char *text, size_t len, size_t *out_len)
+{
+    char *out = malloc(len + 1), *dst = out;
+    const char *p = text, *end = text + len;
+    if (!out) return NULL;
+    while (p < end) {
+        if (end-p >= 6 && p[0]=='\\' && (p[1]=='f'||p[1]=='F') &&
+            (p[2]=='s'||p[2]=='S') && p[3]=='[') {
+            const char *q=p+4;
+            while (q<end && *q>='0' && *q<='9') ++q;
+            if (q>p+4 && q<end && *q==']') {p=q+1;continue;}
+        }
+        *dst++=*p++;
+    }
+    *dst=0;*out_len=(size_t)(dst-out);
+    return out;
+}
+
 /* Reflow the PC-authored flashback prose at native PSP size. Explicit source
  * line breaks are layout hints here; paginate rather than drop a fourth row. */
 static void vm_wait_text(
@@ -5098,20 +5475,32 @@ static void vm_wait_text(
     const char *speaker, size_t speaker_len,
     const char *message, size_t message_len, int continue_message)
 {
-    const char *p = message, *end = message + message_len;
+    if(g_language==4) {
+        russian_lookup(&speaker,&speaker_len);
+        russian_lookup(&message,&message_len);
+    }
+    char *cleaned = strip_message_font_controls(message, message_len, &message_len);
+    const char *p, *end;
+    if (cleaned) message = cleaned;
+    p = message; end = message + message_len;
     char *page, *dst;
     int width = 0, line = 0;
     const uint8_t *space_rec;
     int space_width;
-    if (g_language != 0 || !message_len) {
+    /* Ending captions are separate authored lines, not prose wrap hints. */
+    if ((g_language != 0 && g_language != 4) || !message_len ||
+        (g_language==4 && message_len>=sizeof("КОНЕЦ ")-1 && !memcmp(message,"КОНЕЦ ",sizeof("КОНЕЦ ")-1)) ||
+        (message_len>=4 && !memcmp(message,"END ",4))) {
         vm_wait_text_page(m,char_atlas,tile_x,tile_y,direction_row,
                           speaker,speaker_len,message,message_len,continue_message);
+        free(cleaned);
         return;
     }
     page = malloc(message_len * 2 + 4);
     if (!page) {
         vm_wait_text_page(m,char_atlas,tile_x,tile_y,direction_row,
                           speaker,speaker_len,message,message_len,continue_message);
+        free(cleaned);
         return;
     }
     space_rec = font_find_glyph(' ');
@@ -5153,6 +5542,39 @@ static void vm_wait_text(
     vm_wait_text_page(m,char_atlas,tile_x,tile_y,direction_row,
                       speaker,speaker_len,page,(size_t)(dst-page),continue_message);
     free(page);
+    free(cleaned);
+}
+
+static void vm_pump_stage_message(const MapState *m, void *char_atlas, int x, int y, int direction)
+{
+    int id=g_stage_message_event,i,active;VmEventRecord ev;VmPageRecord pg;
+    StageParallel *r;const uint8_t *p,*q,*end;
+    const char *speaker="",*message="";size_t sl=0,ml=0;
+    if(id<1 || id>=MAX_EVENT_ID)return;
+    g_stage_message_event=0;r=&g_stage_parallel[id];
+    for(i=0;i<m->vm_event_count;++i) {
+        if(!vm_read_event(m,i,&ev) || ev.event_id!=id)continue;
+        if(!vm_active_page_index(m,&ev,&pg,&active) || r->page!=active+1 ||
+           r->text_offset>=pg.cmd_size || (size_t)pg.cmd_offset+pg.cmd_size>m->vm_command_size)break;
+        p=m->vm_commands+pg.cmd_offset+r->text_offset;
+        end=m->vm_commands+pg.cmd_offset+pg.cmd_size;
+        if(end-p<17 || (*p!=VM_OP_TEXT && *p!=VM_OP_TEXT_TRANSPARENT && *p!=VM_OP_TEXT_STYLE))break;
+        {int op=*p++;
+        g_runtime_message_background=op==VM_OP_TEXT_TRANSPARENT?2:0;g_runtime_message_position=2;
+        if(op==VM_OP_TEXT_STYLE){if(end-p<18)break;g_runtime_message_background=*p++;g_runtime_message_position=*p++;}
+        g_runtime_message_transparent=g_runtime_message_background==2;}
+        q=p+16;
+        for(i=0;i<4;++i) {
+            size_t a=read_u16_le(p+i*4),b=read_u16_le(p+i*4+2);
+            if((size_t)(end-q)<a+b)break;
+            if(i==vm_text_language(g_language)){speaker=(const char*)q;message=(const char*)q+a;sl=a;ml=b;}
+            q+=a+b;
+        }
+        if(i==4)vm_wait_text(m,char_atlas,x,y,direction,speaker,sl,message,ml,0);
+        break;
+    }
+    g_runtime_message_transparent=0;g_runtime_message_background=0;
+    r->text_blocked=0;
 }
 
 static int vm_wait_choices(
@@ -5163,6 +5585,10 @@ static int vm_wait_choices(
     SceCtrlData pad;
     uint32_t prev;
     if (count < 1 || count > 6) return -1;
+    if(g_language==4) {
+        int i;
+        for(i=0;i<count;++i)russian_lookup(&g_choice_labels[i],&g_choice_lengths[i]);
+    }
     g_choice_active = 1;
     g_choice_count = count;
     rebuild_choice_text_surface();
@@ -5592,6 +6018,8 @@ static int vm_execute_page(
     int source_map_id;
     int source_event_id;
     int did_transfer = 0;
+    const MapState *previous_owner=g_vm_position_owner;
+    int *previous_x=g_vm_tile_x,*previous_y=g_vm_tile_y,*previous_direction=g_vm_direction;
 
     if (!pg->supported || !m->vm_commands) return 0;
     if ((size_t)pg->cmd_offset + (size_t)pg->cmd_size > m->vm_command_size) return 0;
@@ -5609,6 +6037,8 @@ static int vm_execute_page(
         memcpy(cmd_copy, m->vm_commands + pg->cmd_offset, (size_t)pg->cmd_size);
     source_map_id = m->id;
     source_event_id = ev ? ev->event_id : 0;
+    g_vm_position_owner=m;g_vm_tile_x=tile_x;g_vm_tile_y=tile_y;g_vm_direction=direction_row;
+    reset_factory_checkpoint_tail(source_map_id,source_event_id,pg->trigger);
     p = cmd_copy;
     base = p;
     end = p + pg->cmd_size;
@@ -5618,7 +6048,14 @@ static int vm_execute_page(
         int op = *p++;
         if (op == VM_OP_END) break;
 
-        if (op == VM_OP_TEXT) {
+        if (op == VM_OP_TEXT || op == VM_OP_TEXT_TRANSPARENT || op==VM_OP_TEXT_STYLE) {
+            g_runtime_message_background=op==VM_OP_TEXT_TRANSPARENT?2:0;
+            g_runtime_message_position=2;
+            if(op==VM_OP_TEXT_STYLE) {
+                if(end-p<2)break;
+                g_runtime_message_background=*p++;g_runtime_message_position=*p++;
+            }
+            g_runtime_message_transparent=g_runtime_message_background==2;
             uint16_t sl[4], ml[4];
             const char *speaker = NULL;
             const char *message = NULL;
@@ -5634,7 +6071,7 @@ static int vm_execute_page(
             q = p + 16;
             for (i = 0; i < 4; ++i) {
                 if (q + sl[i] + ml[i] > end) goto vm_done;
-                if (i == lang) {
+                if (i == vm_text_language(lang)) {
                     speaker = (const char *)q;
                     speaker_len = sl[i];
                     message = (const char *)(q + sl[i]);
@@ -5647,8 +6084,9 @@ static int vm_execute_page(
                 m, char_atlas, *tile_x, *tile_y, *direction_row,
                 speaker ? speaker : "", speaker_len,
                 message ? message : "", message_len,
-                p < end && *p == VM_OP_TEXT
+                p < end && (*p == VM_OP_TEXT || *p == VM_OP_TEXT_TRANSPARENT || *p==VM_OP_TEXT_STYLE)
             );
+            g_runtime_message_transparent=0;g_runtime_message_background=0;
         } else if (op == VM_OP_NUMBER_INPUT) {
             int id,digits;
             if(end-p<3)break;
@@ -5673,6 +6111,7 @@ static int vm_execute_page(
             if (first < 0) first = 0;
             if (last >= MAX_SWITCHES) last = MAX_SWITCHES - 1;
             for (i = first; i <= last; ++i) g_switches[i] = (uint8_t)value;
+            reconcile_consumed_items();
         } else if (op == VM_OP_SELF_SWITCH) {
             int idx, value;
             if (end - p < 2) break;
@@ -5682,10 +6121,61 @@ static int vm_execute_page(
                 if (value) g_self_switches[source_map_id][source_event_id] |= (uint8_t)(1u << idx);
                 else g_self_switches[source_map_id][source_event_id] &= (uint8_t)~(1u << idx);
             }
+        } else if (op == VM_OP_SCROLL_TEXT) {
+            int speed, no_fast, i, rows=1; uint16_t lens[4]; const uint8_t *q;
+            const char *text=NULL; size_t len=0;
+            if (end-p<10) break;
+            speed=*p++; no_fast=*p++;
+            for(i=0;i<4;++i) lens[i]=read_u16_le(p+i*2);
+            q=p+8;
+            for(i=0;i<4;++i) {
+                if(q+lens[i]>end) goto vm_done;
+                if(i==vm_text_language(lang)){text=(const char*)q;len=lens[i];}
+                q+=lens[i];
+            }
+            p=q;
+            if(g_language==4)russian_lookup(&text,&len);
+            if(text) {
+                /* Count the same word/glyph wraps used by draw_utf8_wrapped. */
+                const char *c=text,*limit=text+len; float x=36; int in_word=0,color=0;
+                while(c<limit) {
+                    const char *before=c; uint32_t cp; const uint8_t *rec; float adv;
+                    if(parse_text_color_escape(&c,limit,&color))continue;
+                    cp=utf8_next_cp(&c,limit);
+                    if(latin_word_cp(cp)&&!in_word){float w=latin_word_width(before,limit)*0.75f;if(w<=408&&x+w>444&&x>36){x=36;++rows;}}
+                    in_word=latin_word_cp(cp);
+                    if(cp=='\r')continue;
+                    if(cp=='\n'){x=36;++rows;continue;}
+                    rec=font_find_glyph(cp);adv=(rec?rec[7]:10)*0.75f;
+                    if(x+adv>444&&x>36){x=36;++rows;}x+=adv;
+                }
+                g_scroll_text=text;g_scroll_text_len=len;
+                for(g_scroll_text_y=SCREEN_H;g_scroll_text_y>-(rows*25.0f+25);) {
+                    SceCtrlData pad;
+                    vm_render_frame(m,char_atlas,*tile_x,*tile_y,*direction_row,0,0);
+                    sceCtrlPeekBufferPositive(&pad,1);
+                    g_scroll_text_y-=clamp_float(speed,1,8)*0.25f*(!no_fast&&(pad.Buttons&(PSP_CTRL_CROSS|PSP_CTRL_CIRCLE|PSP_CTRL_DOWN))?3:1);
+                }
+                g_scroll_text=NULL;g_scroll_text_len=0;
+            }
+        } else if (op == VM_OP_BALLOON) {
+            int wait;
+            if (end - p < 4) break;
+            g_balloon_target = (int16_t)read_u16_le(p);
+            if (!g_balloon_target) g_balloon_target = source_event_id;
+            g_balloon_id = p[2]; wait = p[3]; p += 4;
+            if (!g_balloon_atlas)
+                g_balloon_atlas = load_exact_file(ASSET_ROOT "balloon_atlas.rgba8888", 512u*512u*4u);
+            g_balloon_frames = g_balloon_atlas && g_balloon_id>=1 && g_balloon_id<=10 ? 76 : 0;
+            if (wait) while (g_balloon_frames > 0)
+                vm_render_frame(m,char_atlas,*tile_x,*tile_y,*direction_row,0,0);
         } else if (op == VM_OP_WAIT) {
             int frames;
             if (end - p < 2) break;
             frames = (int)read_u16_le(p); p += 2;
+            /* Button-room arrival: two frames earlier, only its first wait. */
+            if (source_map_id == 36 && source_event_id == 17 &&
+                p - base == 6 && frames == 120) frames = 118;
             vm_wait_frames(frames, m, char_atlas, *tile_x, *tile_y, *direction_row);
         } else if (op == VM_OP_TRANSFER) {
             int dest_map, dest_x, dest_y, direction, fade;
@@ -5795,7 +6285,10 @@ static int vm_execute_page(
                     vm_render_frame(m, char_atlas, *tile_x, *tile_y, *direction_row, 0, 0);
                 }
             }
-            g_screen_shake_x = 0.0f;
+            if (!wait && m->id>=48 && m->id<=79 && duration>0) {
+                g_stage_shake_power=power;g_stage_shake_speed=speed;
+                g_stage_shake_total=g_stage_shake_frames=duration;
+            } else g_screen_shake_x = 0.0f;
         } else if (op == VM_OP_BGM) {
             int bgm_id;
             if (end - p < 5) break;
@@ -5896,7 +6389,7 @@ static int vm_execute_page(
             expected = (int)p[0];
             target = read_u32_le(p + 1);
             p += 5;
-            if (lang != expected) {
+            if (vm_text_language(lang) != expected) {
                 if (target >= pg->cmd_size) break;
                 p = base + target;
             }
@@ -5980,7 +6473,12 @@ static int vm_execute_page(
             id=read_u16_le(p);p+=2;
             erase_picture_slot(id);
             if(id==6){g_picture6_visible=0;g_picture6_alpha=0;}
-        } else if (op == VM_OP_CHOICES) {
+        } else if (op == VM_OP_CHOICES || op==VM_OP_CHOICES_STYLE) {
+            g_choice_background=0;g_choice_position=2;
+            if(op==VM_OP_CHOICES_STYLE) {
+                if(end-p<2)break;
+                g_choice_background=*p++;g_choice_position=*p++;
+            }
             int count, cancel_index, default_index, ci, li;
             const uint8_t *q;
             if (end - p < 3) break;
@@ -5997,7 +6495,7 @@ static int vm_execute_page(
                 q += 8;
                 for (li = 0; li < 4; ++li) {
                     if ((size_t)(end - q) < lens[li]) goto vm_done;
-                    if (li == lang) {
+                    if (li == vm_text_language(lang)) {
                         g_choice_labels[ci] = (const char *)q;
                         g_choice_lengths[ci] = lens[li];
                     }
@@ -6023,6 +6521,12 @@ static int vm_execute_page(
             vm_call_common(m, ev, common_id, char_atlas, lang, tile_x, tile_y, direction_row);
             lang = g_language;
             if (g_request_title || g_loaded_from_scene) goto vm_done;
+        } else if (op == VM_OP_PARTY) {
+            if (end-p<2) break;
+            player_change_party(p[0],p[1]);p+=2;
+        } else if (op == VM_OP_PARALLAX) {
+            if (end-p<1) break;
+            g_stage_parallax_scrolling=!!*p++;g_stage_parallax_y=0;
         } else if (op == VM_OP_SAVE_ACCESS) {
             if (end - p < 1) break;
             g_save_enabled = *p++ ? 1 : 0;
@@ -6100,6 +6604,8 @@ static int vm_execute_page(
     }
 
 vm_done:
+    g_vm_position_owner=previous_owner;g_vm_tile_x=previous_x;
+    g_vm_tile_y=previous_y;g_vm_direction=previous_direction;
     free(cmd_copy);
     return did_transfer;
 }
@@ -6654,6 +7160,8 @@ int main(int argc, char *argv[])
     init_gu();
     if (!init_runtime_font())
         fatal_error("Could not load v0.7.9 runtime font assets");
+    if (!init_russian())
+        fatal_error("Could not load russian177.bin");
     if (!init_ui_data())
         fatal_error("Could not load v0.7.9 UI assets");
     load_common_vm();
@@ -6739,6 +7247,10 @@ TITLE_ENTRY:
         sceCtrlPeekBufferPositive(&pad, 1);
         pressed = pad.Buttons & ~prev_buttons;
 
+        if (g_stage_message_event) {
+            vm_pump_stage_message(&map,char_atlas,tile_x,tile_y,direction_row);
+            sceCtrlPeekBufferPositive(&pad,1);prev_buttons=pad.Buttons;pressed=0;
+        }
         vm_tick_story_parallel(&map);
 
         if (!moving && !g_player_route.records) {
@@ -6847,6 +7359,17 @@ TITLE_ENTRY:
                 );
 
                 if (!vm_result) {
+                    if (direction_row == 0) fy++;
+                    else if (direction_row == 1) fx--;
+                    else if (direction_row == 2) fx++;
+                    else if (direction_row == 3) fy--;
+                    vm_result = vm_run_event_at(
+                        &map, fx, fy, -3, char_atlas, lang,
+                        &tile_x, &tile_y, &direction_row
+                    );
+                }
+
+                if (!vm_result && counter_at(&map, fx, fy)) {
                     if (direction_row == 0) fy++;
                     else if (direction_row == 1) fx--;
                     else if (direction_row == 2) fx++;
@@ -7031,10 +7554,23 @@ TITLE_ENTRY:
             }
         }
 
+        /* The spider hold timer can expire while Enri is idle. Dispatch the
+         * original death autorun as soon as its switch is raised. */
+        if (((map.id==67 || map.id==68) && g_switches[831]) || (map.id==69 && g_switches[736])) {
+            vm_run_autoruns(&map,char_atlas,lang,&tile_x,&tile_y,&direction_row);
+            if (g_request_title) goto TITLE_ENTRY;
+            continue;
+        }
         if (is_chase_map(map.id) && !g_s003_paused) {
-            int contact = vm_run_event_at(&map,tile_x,tile_y,2,char_atlas,lang,
-                                          &tile_x,&tile_y,&direction_row);
-            if (!contact && moving)
+            /* MZ commits the player's logical destination when a step starts.
+             * In the giant-spider corridor, checking the departing cell too
+             * catches Enri after she has already escaped that contact tile. */
+            int logical_contact = map.id==72 && moving;
+            int contact = vm_run_event_at(&map,
+                                          logical_contact ? target_x : tile_x,
+                                          logical_contact ? target_y : tile_y,
+                                          2,char_atlas,lang,&tile_x,&tile_y,&direction_row);
+            if (!contact && moving && map.id!=72)
                 contact=vm_run_event_at(&map,target_x,target_y,2,char_atlas,lang,
                                        &tile_x,&tile_y,&direction_row);
             if (contact) {

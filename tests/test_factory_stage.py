@@ -15,7 +15,7 @@ for mid in range(32,36):
    visible=bool(page['image']['characterName']or page['image']['tileId']);assert bool(ref)==visible
    if ref:
     rec=records[ref-1];assert rec[-1]==eid;sx,sy,sw,sh=rec[2:6];page_index=sx>>12;sx&=0xFFF;assert page_index in (0,1)and (page_index==0 or mid==32);flags=rec[7]
-    if page['image']['characterName']=='S-003':assert(flags&0xC4)==0xC4 and(sw,sh)==(54,108);assert sx+6*sw<=512 and sy+2*sh<=512
+    if page['image']['characterName']=='S-003':assert(flags&0xC4)==0xC4 and(sw,sh)==(72,144);assert sx+6*sw<=512 and sy+2*sh<=512
     else:assert sx+sw*(3 if flags&2 else 1)<=512 and sy+sh*(4 if flags&64 else 1)<=512
    for c in page['list']:
     if c['code']==231 and c['parameters'][1]!='A1':assert(r/'assets'/f"pic_{w.PICTURE_IDS[c['parameters'][1]]:03}.p44").is_file()
@@ -39,7 +39,7 @@ s=(r/'main.c').read_text();n=runpy.run_path(str(r/'tests/test_s003_runtime.py'))
 pre=pre.replace('static int first,active,blocked_axis;','static int first,active,blocked_axis,test_id=3;').replace('{3,6,8,first}','{test_id,6,8,first}')
 pre=pre.replace('static void play_vm_se_params(int a,int b,int c,int d){}','static int sounds;static void play_vm_se_params(int a,int b,int c,int d){++sounds;}\nstatic void vm_begin_screen_flash(int a,int b,int c,int d,int f){}\nstatic unsigned char g_switches[1024];')
 a=s.index('static int event_route_can_step(');b=s.index('static void tick_player_route(',a);engine=s[a:b]
-a=s.index('static void tick_factory_parallel(');b=s.index('static void render_world(',a);parallel=s[a:b]
+a=s.index('static void tick_factory_parallel(');b=s.index('#include "runtime/stage_parallel.h"',a);parallel=s[a:b]
 post='''int main(void){MapState m={32,1};test_id=23;first=7;active=first+1;g_s003_paused=0;
 tick_factory_autonomous(&m);assert(g_routes[23].records);tick_event_routes(&m);assert(g_event_shift_y[23]<0);
 active=first;tick_factory_autonomous(&m);assert(!g_routes[23].records);

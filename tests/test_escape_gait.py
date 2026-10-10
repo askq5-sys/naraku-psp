@@ -19,6 +19,8 @@ static int g_event_direction[160],g_event_opacity[160];static struct{int pattern
 static void *g_event_texture_base=(void*)1,*g_event_texture_detail=(void*)2,*g_event_texture_bound;
 static void *bound;static float srcx,dstw,dsth;static int filter;
 static int is_chase_enemy(int m,int id){return (m==32&&id==23);}
+static int is_spider_enemy(int m,int id){return (m==67&&id>=1&&id<=4)||(m==68&&id==2);}
+
 static float render_floor_pixel(float x){return (int)x;}
 static void bind_texture_8888(void*p,int w,int h){bound=p;}
 static void sceGuTexFilter(int a,int b){filter=a;}
@@ -36,5 +38,5 @@ g_routes[7].dx=1;g_event_direction[7]=2;
 for(int step=0;step<13;step++){static const int gait[]={1,2,1,0};g_event_shift_x[7]=step+.5f;draw_event_sprite_record(&sp,35,0,0,0,0);assert(srcx==1+54*gait[(step+7)&3]);}
 g_routes[7].records=0;draw_event_sprite_record(&sp,35,0,0,0,0);assert(srcx==55);return 0;}'''
 with tempfile.TemporaryDirectory() as tmp:
- p=Path(tmp)/'t.c';e=Path(tmp)/'t';p.write_text(pre+s[a:b]+post);subprocess.run(['cc','-std=c99',str(p),'-o',str(e)],check=True);subprocess.run([str(e)],check=True)
+ p=Path(tmp)/'t.c';e=Path(tmp)/'t';p.write_text(pre+s[s.index("static unsigned int g_ambush_reveal_start;"):s.index("static void draw_event_sprite_record(")]+s[a:b]+post);subprocess.run(['cc','-std=c99',str(p),'-o',str(e)],check=True);subprocess.run([str(e)],check=True)
 print('PASS: actual renderer selects walking poses for all seven up and thirteen right steps; pauses and route end use idle')

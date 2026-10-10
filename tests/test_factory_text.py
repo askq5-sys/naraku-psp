@@ -1,7 +1,7 @@
 from pathlib import Path
 import json,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[1];s=(root/'main.c').read_text()
-a=s.index('static void vm_wait_text(\n');b=s.index('static int vm_wait_choices(',a)
+a=s.index('static char *strip_message_font_controls(');b=s.index('static int vm_wait_choices(',a)
 pre=r'''#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -30,7 +30,7 @@ for ev in m['events']:
    elif buf:cases.append('\n'.join(buf));buf=[]
 post='int main(int argc,char**argv){FILE*f=fopen(argv[1],"rb");assert(f);font_size=fread(font,1,sizeof(font),f);fclose(f);MapState m={12};'
 for t in cases:
- visible=re.sub(r'\\[cC]\[\d+\]', '', t);expected=sum(not c.isspace()for c in visible)
+ visible=re.sub(r'\\(?:[cC]|[fF][sS])\[\d+\]', '', t);expected=sum(not c.isspace()for c in visible)
  post+='total=0;vm_wait_text(&m,NULL,0,0,0,"Emma",4,'+json.dumps(t,ensure_ascii=False)+','+str(len(t.encode()))+',0);assert(total=='+str(expected)+');'
 post+='return 0;}'
 with tempfile.TemporaryDirectory()as tmp:

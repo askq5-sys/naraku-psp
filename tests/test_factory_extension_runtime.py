@@ -31,7 +31,7 @@ for(int digits=1;digits<=8;digits++)for(int cursor=0;cursor<digits;cursor++){
  assert(number_input_change_digit(9*place,digits,cursor,1)==0);
  assert(number_input_change_digit(3*place,digits,cursor,1)==4*place);
 }return 0;}'''
-compile_run(pre+s[a:b]+post)
+compile_run(pre+s[s.index("static unsigned int g_ambush_reveal_start;"):s.index("static void draw_event_sprite_record(")]+s[a:b]+post)
 # Run the new fade opcode's actual body and retain black through subsequent waits.
 a=s.index('        } else if (op == VM_OP_FADE_SCREEN) {');b=s.index('        } else if (op == VM_OP_SWITCH) {',a)
 body=s[a:b].split('{',1)[1]
@@ -64,6 +64,7 @@ post='''int main(void){for(int i=0;i<160;i++)g_event_opacity[i]=255;
 EventSpriteRecord sensor={7,5,1,1,48,192,69,5};for(int row=0;row<4;row++){g_event_direction[5]=row;draw_event_sprite_record(&sensor,43,0,0,0,0);assert(srcx==1+(row&1)*48&&srcy==1+(row>>1)*192&&dstw==24&&dsth==96);}
 EventSpriteRecord lever={12,4,4097,1,108,324,5,1};draw_event_sprite_record(&lever,40,0,0,0,0);assert(bound==(void*)2&&dstw==72&&dsth==216);
 EventSpriteRecord actor={8,10,1,1,48,78,196,4};for(int row=0;row<4;row++)for(int pat=0;pat<3;pat++){g_event_direction[4]=row;g_event_animation[4].pattern=pat;draw_event_sprite_record(&actor,39,0,0,0,0);assert(srcx==1+((row&1)*3+pat)*48&&srcy==1+(row>>1)*78&&dstw==24&&dsth==39);}
+EventSpriteRecord giant={8,10,1,1,240,192,132,2};for(int pat=0;pat<3;pat++){g_event_animation[2].pattern=pat;draw_event_sprite_record(&giant,72,0,0,0,0);assert(srcx==1+(pat&1)*240&&srcy==1+(pat>>1)*192&&dstw==120&&dsth==96);}
 EventSpriteRecord key={5,5,1,1,48,48,30,12};int poses=0;for(int f=0;f<72;f++){g_world_render_frames=f;draw_event_sprite_record(&key,43,0,0,0,0);if(srcx!=49)poses++;}assert(poses);return 0;}'''
-compile_run(pre+s[a:b]+post)
+compile_run(pre+s[s.index("static unsigned int g_ambush_reveal_start;"):s.index("static void draw_event_sprite_record(")]+s[a:b]+post)
 print('PASS: actual C number-input navigation/digit wrap, persistent 24-frame fade, sensor startup/directions/page cancel, classroom stepping, packed sensor/actor atlas coordinates, crank display size, key animation')

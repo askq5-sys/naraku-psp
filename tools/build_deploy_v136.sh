@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+DEST="${1:-/mnt/c/Users/Rgood/Documents/PPSSPP/PSP/GAME/NARAKU}"
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+test -d "$DEST/assets" || { echo "Deploy the complete game first: $DEST/assets is missing"; exit 1; }
+python3 - "$ROOT_DIR/CMakeLists.txt" <<'PY'
+import re,sys
+from pathlib import Path
+p=Path(sys.argv[1]);s=p.read_text();s,n=re.subn(r'(\bVERSION\s+)(?:00|01)\.\d+',r'\g<1>01.36',s,count=1)
+if n:p.write_text(s)
+PY
+mkdir -p "$ROOT_DIR/build_menu136"
+cd "$ROOT_DIR/build_menu136"
+psp-cmake ..
+make -B -j"$(nproc)"
+test -s EBOOT.PBP
+if ! cp EBOOT.PBP "$DEST/EBOOT.PBP"; then
+    echo "Build succeeded, but deploy failed. Close PPSSPP and copy manually:"
+    echo "$ROOT_DIR/build_menu136/EBOOT.PBP -> $DEST/EBOOT.PBP"
+    exit 1
+fi
+for font_file in "$ROOT_DIR/assets/font_map.bin" "$ROOT_DIR"/assets/font_page*.t8; do
+    test -s "$font_file" || { echo "Font patch asset missing: $font_file"; exit 1; }
+    cp "$font_file" "$DEST/assets/$(basename "$font_file")"
+done
+for stage_file in "$ROOT_DIR"/assets/map028* "$ROOT_DIR"/assets/map029* "$ROOT_DIR"/assets/map030* "$ROOT_DIR"/assets/map031* "$ROOT_DIR"/assets/map032* "$ROOT_DIR"/assets/map033* "$ROOT_DIR"/assets/map034* "$ROOT_DIR"/assets/map035* "$ROOT_DIR"/assets/map036* "$ROOT_DIR"/assets/map037* "$ROOT_DIR"/assets/map038* "$ROOT_DIR"/assets/map039* "$ROOT_DIR"/assets/map040* "$ROOT_DIR"/assets/map041* "$ROOT_DIR"/assets/map042* "$ROOT_DIR"/assets/map043* "$ROOT_DIR"/assets/map044* "$ROOT_DIR"/assets/map045* "$ROOT_DIR"/assets/map046* "$ROOT_DIR"/assets/map047* "$ROOT_DIR"/assets/map048* "$ROOT_DIR"/assets/map049* "$ROOT_DIR"/assets/map050* "$ROOT_DIR"/assets/map051* "$ROOT_DIR"/assets/map052* "$ROOT_DIR"/assets/map053* "$ROOT_DIR"/assets/map054* "$ROOT_DIR"/assets/map055* "$ROOT_DIR"/assets/map056* "$ROOT_DIR"/assets/map057* "$ROOT_DIR"/assets/map058*; do
+    case "$stage_file" in *_preview.png) continue ;; esac
+    test -f "$stage_file" || continue
+    cp "$stage_file" "$DEST/assets/$(basename "$stage_file")"
+done
+cp "$ROOT_DIR/assets/map025.bin" "$DEST/assets/map025.bin"
+for picture_file in "$ROOT_DIR"/assets/pic_*.p44; do
+    test -f "$picture_file" || continue
+    cp "$picture_file" "$DEST/assets/$(basename "$picture_file")"
+done
+cp "$ROOT_DIR/assets/parallax_chain.rgba8888" "$DEST/assets/parallax_chain.rgba8888"
+cp "$ROOT_DIR/assets/ui_iconset.rgba4444" "$DEST/assets/ui_iconset.rgba4444"
+for fall_file in map001_events.bin map001_event_atlas.rgba8888; do
+    cp "$ROOT_DIR/assets/$fall_file" "$DEST/assets/$fall_file"
+done
+for text_file in "$ROOT_DIR"/assets/map*_vm.bin; do
+    cp "$text_file" "$DEST/assets/$(basename "$text_file")"
+done
+for story_file in "$ROOT_DIR"/assets/map015_* "$ROOT_DIR"/assets/map016_* "$ROOT_DIR"/assets/map021_* "$ROOT_DIR"/assets/map027_* "$ROOT_DIR"/assets/map022_* "$ROOT_DIR"/assets/map023_* "$ROOT_DIR"/assets/map012_* "$ROOT_DIR"/assets/map013_* "$ROOT_DIR"/assets/map026_* "$ROOT_DIR"/assets/map024_* "$ROOT_DIR"/assets/map025_* "$ROOT_DIR"/assets/*_exact_*.pcm; do
+    case "$story_file" in *_preview.png) continue ;; esac
+    test -f "$story_file" || continue
+    cp "$story_file" "$DEST/assets/$(basename "$story_file")"
+done
+echo "NARAKU 1.3.6 deployed; assets, saves and XMB configuration preserved."

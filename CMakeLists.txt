@@ -36,6 +36,6 @@ endif()
 create_pbp_file(
     TARGET ${PROJECT_NAME}
     TITLE "NARAKU PSP"
-    VERSION 01.33
+    VERSION 01.78
     ${NARAKU_XMB_ARGS}
 )

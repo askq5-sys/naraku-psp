@@ -9,6 +9,7 @@ pre=r'''#include <stdint.h>
 #include <string.h>
 #include <assert.h>
 #include "runtime/player_animation.h"
+#include "runtime/laser_chase_trail.h"
 #define MAX_EVENT_ID 160
 #define TILE_PX 24
 static const char*g_scene_trace_path="/dev/null";

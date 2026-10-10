@@ -1,0 +1,1 @@
+1.0.9 diagnostic build. Writes assets/scene_trace.log at startup and on each Map012 VM instruction. Blocked routes use same log. No script skipping/timeouts. After reproducing freeze, send assets/scene_trace.log.

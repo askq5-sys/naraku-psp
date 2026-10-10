@@ -1,0 +1,2 @@
+NARAKU PSP 1.5.6 - Secret ladder occlusion
+Requires 1.5.4 or 1.5.5. Reverts the early transfer from 1.5.5. The player is clipped behind the upper ladder lip in Map105 while climbing; the scene underneath remains visible. The original transfer event and walking movement are preserved. Scissor is restored immediately after player rendering. No save or asset changes. Host syntax verified; PSP/PPSSPP visual result unverified.

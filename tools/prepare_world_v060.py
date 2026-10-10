@@ -354,11 +354,14 @@ def localized_lines(page, texts, lang_key):
         def repl(m):
             idx = int(m.group(1))
             if 0 <= idx < len(texts):
-                return str(texts[idx].get(lang_key, ""))
+                return (str(texts[idx].get(lang_key, "")).replace("Obtained an Iron Key.", "Obtained a Green Key.")
+                    if lang_key=="en_US" and idx in (1308,1329) else str(texts[idx].get(lang_key, "")))
             return ""
         raw = re.sub(r"\\I18N\[(\d+)\]", repl, raw)
         raw = re.sub(r"\\[cC]\[\d+\]", "", raw)
         raw = re.sub(r"\\[iI]\[\d+\]", "", raw)
+        # Font-size controls are PC layout directives, never visible dialogue.
+        raw = re.sub(r"\\[fF][sS]\[\d+\]", "", raw)
         raw = raw.replace("\\.", "").replace("\\|", "")
         out.append(raw)
     return out
@@ -455,7 +458,7 @@ def rectangle_pack(frames):
     """Pack crowded factory sheets without discarding frames or reducing pixels."""
     free=[(0,0,EVENT_ATLAS_W,EVENT_ATLAS_H)]
     atlas=Image.new("RGBA",(EVENT_ATLAS_W,EVENT_ATLAS_H),(0,0,0,0));positions={}
-    for key,frame in sorted(frames,key=lambda item: (-max(item[1].size),-item[1].width*item[1].height)):
+    for key,frame in sorted(frames,key=lambda item: (-item[1].height,-item[1].width*item[1].height)):
         w,h=frame.width+2,frame.height+2
         candidates=[(min(fw-w,fh-h),max(fw-w,fh-h),y,x)for x,y,fw,fh in free if fw>=w and fh>=h]
         if not candidates:raise RuntimeError("Factory atlas overflow")
@@ -485,7 +488,28 @@ def factory_atlas_pack(frames):
             except RuntimeError: continue
             group.append(item);break
         else: groups.append([item])
-    if len(groups)>2:raise RuntimeError("Factory requires more than two event texture pages")
+    if len(groups)>2:
+        # Full native actors sometimes fragment the greedy partition. Retry
+        # deterministic partitions before increasing PSP texture memory.
+        import random
+        rng = random.Random(139)
+        for attempt in range(300):
+            order = list(frames)
+            rng.shuffle(order)
+            trial = [[], []]
+            for item in order:
+                choices = [0, 1]
+                rng.shuffle(choices)
+                for index in choices:
+                    try: rectangle_pack(trial[index] + [item])
+                    except RuntimeError: continue
+                    trial[index].append(item)
+                    break
+                else: break
+            else:
+                groups = [group for group in trial if group]
+                break
+        else: raise RuntimeError("Native frames do not fit two event texture pages")
     atlases=[];positions={}
     for i,group in enumerate(groups):
         atlas,pos=rectangle_pack(group);atlases.append(atlas)
@@ -508,7 +532,8 @@ FONT_PER_PAGE = FONT_COLS * FONT_ROWS
 FONT_SIZE = 20
 
 VM_SUPPORTED_CODES = {
-    135, 0, 101, 103, 221, 222, 401, 121, 122, 123, 230, 201, 250, 126, 241, 242,
+    129, 112, 113, 413, 284, 105, 405,
+    213, 135, 0, 101, 103, 221, 222, 401, 121, 122, 123, 230, 201, 250, 126, 241, 242,
     223, 224, 211, 118, 115, 352, 354, 355, 111, 411, 412, 231, 235,
     205, 505, 102, 402, 403, 404, 117, 232, 204, 225, 251, 214
 }
@@ -552,6 +577,10 @@ VM_OP_ERASE_EVENT = 35
 VM_OP_SAVE_ACCESS = 36
 VM_OP_FADE_SCREEN = 37
 VM_OP_NUMBER_INPUT = 38
+VM_OP_PARTY = 41
+VM_OP_BALLOON = 42
+VM_OP_SCROLL_TEXT = 43
+VM_OP_PARALLAX = 39
 
 SCENE_ITEM = 1
 SCENE_STATUS = 2
@@ -599,7 +628,8 @@ def localized_string(raw, texts, lang_key):
     def repl(m):
         idx = int(m.group(1))
         if 0 <= idx < len(texts) and isinstance(texts[idx], dict):
-            return str(texts[idx].get(lang_key, ""))
+            return (str(texts[idx].get(lang_key, "")).replace("Obtained an Iron Key.", "Obtained a Green Key.")
+                    if lang_key=="en_US" and idx in (1308,1329) else str(texts[idx].get(lang_key, "")))
         return ""
     raw = re.sub(r"\\I18N\[(\d+)\]", repl, raw)
     # Keep RPG Maker text-colour escapes (\\c[n]).  The PSP runtime now
@@ -607,10 +637,16 @@ def localized_string(raw, texts, lang_key):
     # \c[18]Cleaver\c[0] retain the exact red emphasis used by NARAKU.
     # Icon escapes are still omitted until the inline-icon renderer lands.
     raw = re.sub(r"\\[iI]\[\d+\]", "", raw)
+    # Font-size controls are PC layout directives, never visible dialogue.
+    raw = re.sub(r"\\[fF][sS]\[\d+\]", "", raw)
     raw = raw.replace("\\.", "").replace("\\|", "")
     raw = raw.replace("\\!", "").replace("\\>", "").replace("\\<", "")
     if lang_key == "en_US":
         raw = raw.replace("\n", " ")
+        raw = raw.replace("Destroy with cleaver", "Destroy with \\c[18]Cleaver\\c[0]")
+        raw = raw.replace("Destroy with axe", "Destroy with \\c[8]Axe\\c[0]")
+        raw = raw.replace("The axe broke.", "The \\c[8]Axe\\c[0] broke.")
+        raw = raw.replace("Also... I brought a \\c[18]cleaver", "Also... I brought a \\c[18]Cleaver")
         raw = raw.replace("thesematerials", "these materials").replace("towait", "to wait").replace("Mrs.Peliah", "Mrs. Peliah")
         raw = re.sub(r"\s+", " ", raw).strip()
     return raw
@@ -702,7 +738,7 @@ def prepare_runtime_font(game, out, texts, font_path):
 def route_supported(route):
     if not isinstance(route, dict):
         return False
-    supported = {0,1,2,3,4,13,14,15,16,17,18,19,29,31,32,33,34,35,36,37,38,39,40,42,44}
+    supported = {0,1,2,3,4,10,13,14,15,16,17,18,19,29,31,32,33,34,35,36,37,38,39,40,42,44}
     for rc in route.get("list", []):
         if int(rc.get("code", 0)) not in supported:
             return False
@@ -750,6 +786,10 @@ def page_vm_supported(page):
         par = cmd.get("parameters", [])
         if code not in VM_SUPPORTED_CODES:
             return False
+        if code == 129 and (len(par)<3 or par[0] not in (1,4,5,6,7,8,9,10) or par[1] not in (0,1) or par[2]):
+            return False
+        if code == 284 and (len(par)<5 or str(par[0]) != "鎖の背景" or any(par[1:])):
+            return False
         if code == 103 and (len(par)<2 or not 1<=int(par[0])<64 or not 1<=int(par[1])<=8):
             return False
         if code == 111 and not branch_supported(par):
@@ -779,7 +819,7 @@ def page_vm_supported(page):
             if len(par) < 2 or int(par[0]) < -1 or not route_supported(par[1]):
                 return False
             if int(par[0]) >= 0 and any(int(rc.get("code",0)) not in
-                    {0,1,2,3,4,13,14,15,16,17,18,19,29,37,38,39,40,42,44} for rc in par[1].get("list", [])):
+                    {0,1,2,3,4,10,13,14,15,16,17,18,19,29,35,36,37,38,39,40,42,44} for rc in par[1].get("list", [])):
                 return False
         # 505 is a route continuation already represented inside command 205.
     return True
@@ -835,12 +875,13 @@ def _emit_condition(out, par):
     raise RuntimeError(f"unsupported branch: {par}")
 
 
-def compile_vm_commands(page, texts):
+def compile_vm_commands(page, texts, preserve_message_background=False):
     out = bytearray()
     lst = page.get("list", [])
     i = 0
     branch_stack = []
     choice_stack = []
+    loop_stack = []
     while i < len(lst):
         cmd = lst[i]
         code = int(cmd.get("code", 0))
@@ -851,6 +892,18 @@ def compile_vm_commands(page, texts):
             # Treat it as a no-op here; the Python list boundary is the real
             # end of this compiled command stream.
             i += 1
+            continue
+        if code == 105:
+            lines = []
+            j = i + 1
+            while j < len(lst) and int(lst[j].get("code", 0)) == 405:
+                lines.append(str(lst[j]["parameters"][0]))
+                j += 1
+            variants = ["\n".join(localized_string(x, texts, lk) for x in lines).encode("utf-8") for lk in LANG_KEYS]
+            out += struct.pack("<BBB", VM_OP_SCROLL_TEXT, int(par[0]), int(bool(par[1])))
+            out += struct.pack("<4H", *(len(v) for v in variants))
+            for value in variants: out += value
+            i = j
             continue
         if code == 101:
             speaker_raw = str(par[4]) if len(par) >= 5 else ""
@@ -865,14 +918,15 @@ def compile_vm_commands(page, texts):
                 speaker = localized_string(speaker_raw, texts, lkey).encode("utf-8")
                 message = "\n".join(localized_string(x, texts, lkey) for x in lines).encode("utf-8")
                 variants.append((speaker, message))
-            out.append(VM_OP_TEXT)
+            out.append(44 if preserve_message_background else VM_OP_TEXT)
+            if preserve_message_background:out += bytes((int(par[2]),int(par[3])))
             for speaker, message in variants:
                 out += struct.pack("<HH", len(speaker), len(message))
             for speaker, message in variants:
                 out += speaker + message
             i = j
             continue
-        if code in (401, 505):
+        if code in (401, 405, 505):
             i += 1
             continue
         if code == 102:
@@ -880,7 +934,9 @@ def compile_vm_commands(page, texts):
             n = len(opts)
             cancel = int(par[1]) if len(par) > 1 else -1
             default = int(par[2]) if len(par) > 2 else 0
-            out += struct.pack("<BBBB", VM_OP_CHOICES, n, cancel & 255, default & 255)
+            if preserve_message_background:out += bytes((45,int(par[4]),int(par[3])))
+            else:out.append(VM_OP_CHOICES)
+            out += bytes((n,cancel & 255,default & 255))
             for option in opts:
                 variants = [localized_string(option, texts, lk).encode("utf-8") for lk in LANG_KEYS]
                 out += struct.pack("<4H", *(len(v) for v in variants))
@@ -906,6 +962,20 @@ def compile_vm_commands(page, texts):
                 ctx = choice_stack.pop()
                 if ctx["last"] is not None: _patch_u32(out, ctx["last"], len(out))
                 for pos in ctx["end_jumps"]: _patch_u32(out, pos, len(out))
+        elif code == 112:
+            loop_stack.append((int(cmd.get("indent",0)),len(out),[]))
+        elif code == 113:
+            if not loop_stack:raise ValueError("Break outside RPG Maker loop")
+            out.append(VM_OP_JUMP);loop_stack[-1][2].append(len(out));out += b"\0\0\0\0"
+        elif code == 413:
+            if not loop_stack or loop_stack[-1][0] != int(cmd.get("indent",0)):
+                raise ValueError("Unmatched RPG Maker loop")
+            _, target, breaks = loop_stack.pop()
+            out.append(VM_OP_JUMP);out += struct.pack("<I",target)
+            for pos in breaks:_patch_u32(out,pos,len(out))
+        elif code == 284:
+            # This stage stops the chain panorama scrolling when the lift stops.
+            out += bytes((VM_OP_PARALLAX, 0 if str(par[0])=="鎖の背景" else 1))
         elif code == 103:
             out.append(VM_OP_NUMBER_INPUT)
             out += struct.pack("<HB", int(par[0]),int(par[1]))
@@ -1042,6 +1112,10 @@ def compile_vm_commands(page, texts):
                     p1 = int(rp[0]) if len(rp) > 0 and isinstance(rp[0], (int,float)) else 0
                     p2 = int(rp[1]) if len(rp) > 1 and isinstance(rp[1], (int,float)) else 0
                 out += struct.pack("<Bhh", rcode, p1, p2)
+        elif code == 213:
+            out += struct.pack("<BhBB", VM_OP_BALLOON, int(par[0]), int(par[1]), int(bool(par[2])))
+        elif code == 129:
+            out += struct.pack("<BBB", VM_OP_PARTY, int(par[0]), int(par[1]))
         elif code == 135:
             out += struct.pack("<BB", VM_OP_SAVE_ACCESS, 1 if int(par[0]) == 0 else 0)
         elif code == 352:
@@ -1148,7 +1222,7 @@ def compile_common_events(game, texts, out):
         safe = ce is not None and page_vm_supported({"list":commands}) and not any(
             int(c.get("code", 0)) == 201 for c in commands)
         if safe:
-            code = compile_vm_commands({"list":commands}, texts)
+            code = compile_vm_commands({"list":commands}, texts,preserve_message_background=True)
             records += struct.pack("<II", base + len(codeblob), len(code))
             codeblob += code
             supported += 1
@@ -1181,9 +1255,83 @@ def adapt_plant1_worm(map_data):
     return data
 
 
-def compile_map_vm(map_data, texts, out_path, sprite_refs=None):
+def adapt_stage_142(map_data, map_id):
+    """Preserve the broken lever state and approach the ending without a warp."""
+    if map_id not in (55,62) or map_data.get("_adapted142"):
+        return map_data
+    data = copy.deepcopy(map_data)
+    data["_adapted142"] = True
+    if map_id == 55:
+        lever = data["events"][1]
+        assert [p["image"]["tileId"] for p in lever["pages"]] == [465,457,449]
+        broken = copy.deepcopy(lever["pages"][-1])
+        broken["conditions"]["switch1Id"] = 632
+        broken["conditions"]["switch1Valid"] = True
+        lever["pages"].append(broken)
+    else:
+        for eid in (4,5,6,7):
+            event = data["events"][eid]
+            scene = event["pages"][0]
+            assert event["y"] == 10 and scene["trigger"] == 1
+            assert [c["code"] for c in scene["list"][:3]] == [223,201,223]
+            assert scene["list"][1]["parameters"] == [0,62,7,9,0,0]
+            event["y"] = 9
+            dx = 7-event["x"]
+            route = [{"code":3 if dx>0 else 2,"indent":None} for _ in range(abs(dx))]
+            route.append({"code":0})
+            align = {"code":205,"indent":0,"parameters":[-1,{"list":route,"repeat":False,"skippable":False,"wait":True}]}
+            # Begin at the old transfer destination row, retain its three steps
+            # down and the entire branch-specific ending after the approach.
+            scene["list"] = ([align] if dx else []) + scene["list"][2:]
+    return data
+
+
+def adapt_stage_150(map_data, map_id):
+    # The original post-credits transition is now implemented.
+    return map_data
+
+
+def adapt_stage_152(map_data, map_id):
+    if not (80<=map_id<=104 or 111<=map_id<=139) or map_data.get("_adapted152"):
+        return map_data
+    data=copy.deepcopy(map_data);data["_adapted152"]=True
+    for event in data["events"]:
+        if not event:continue
+        for page in event["pages"]:
+            if any(c["code"]==201 and c["parameters"][1] not in (*range(80,105),*range(111,140)) for c in page["list"]):
+                page["list"]=[
+                    {"code":101,"indent":0,"parameters":["",0,0,2,""]},
+                    {"code":401,"indent":0,"parameters":["The next area is not included yet.\nYou can save at the book in Will's house."]},
+                    {"code":115,"indent":0,"parameters":[]},
+                    {"code":0,"indent":0,"parameters":[]}]
+    return data
+
+
+def adapt_stage_151(map_data, map_id):
+    """Start Ending 2 at the approach row; align by walking, never transfer."""
+    if map_id!=78 or map_data.get("_adapted151"):
+        return map_data
+    data=copy.deepcopy(map_data)
+    data["_adapted151"]=True
+    for eid in (2,8,9,10):
+        event=data["events"][eid];scene=event["pages"][0]
+        assert event["y"]==10 and scene["trigger"]==1
+        assert [c["code"] for c in scene["list"][:3]]==[223,201,223]
+        assert scene["list"][1]["parameters"]==[0,78,7,9,0,0]
+        event["y"]=9
+        dx=7-event["x"]
+        route=[{"code":3 if dx>0 else 2,"indent":None} for _ in range(abs(dx))]
+        route.append({"code":0})
+        align={"code":205,"indent":0,"parameters":[-1,{"list":route,
+            "repeat":False,"skippable":False,"wait":True}]}
+        scene["list"]=([align] if dx else [])+scene["list"][2:]
+    return data
+
+
+def compile_map_vm(map_data, texts, out_path, sprite_refs=None, tile_flags=None):
     if Path(out_path).name == "map009_vm.bin":
         map_data = adapt_plant1_worm(map_data)
+    map_data = adapt_stage_151(adapt_stage_142(map_data, int(Path(out_path).stem[3:6])), int(Path(out_path).stem[3:6]))
     events = []
     pages = []
     blob = bytearray()
@@ -1197,9 +1345,17 @@ def compile_map_vm(map_data, texts, out_path, sprite_refs=None):
         ev_pages = ev.get("pages", [])
         for page_index, page in enumerate(ev_pages):
             flags, sw1, sw2, self_idx = vm_page_conditions(page)
+            tile_id=int(page.get("image",{}).get("tileId",0))
+            if tile_flags is not None and tile_id>0 and page.get("priorityType")==0:
+                tile_flag=tile_flags[tile_id]
+                if not tile_flag&0x10:
+                    # Bit3 marks passage metadata; upper nibble stores the
+                    # original blocked directions. Low three condition bits
+                    # retain their original meaning and record size is stable.
+                    flags |= 8 | ((tile_flag&15)<<4)
             supported = page_vm_supported(page)
             cmd_off = len(blob)
-            code = compile_vm_commands(page, texts) if supported else bytes([VM_OP_END])
+            code = compile_vm_commands(page, texts, preserve_message_background=True) if supported else bytes([VM_OP_END])
             blob += code
             trigger = int(page.get("trigger", 0))
             if 0 <= trigger < len(trigger_counts): trigger_counts[trigger] += 1
@@ -1232,7 +1388,7 @@ def compile_map_vm(map_data, texts, out_path, sprite_refs=None):
     event_size = 10
     page_size = 20
     cmd_off_abs = header_size + len(events)*event_size + len(pages)*page_size
-    vm_flags = 1 if sprite_refs is not None else 0
+    vm_flags = (1 if sprite_refs is not None else 0) | (2 if tile_flags is not None else 0)
     raw = bytearray(struct.pack("<4sHHIII", b"NV40", len(events), len(pages), cmd_off_abs, len(blob), vm_flags))
     for e in events:
         raw += struct.pack("<HHHHBB", e[0], e[1], e[2], e[3], e[4], 0)
@@ -1282,6 +1438,7 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
         if not EXACT_BGM_IDS:
             EXACT_BGM_IDS = {audio_key(row): int(row["id"]) for row in audio_rows if row["kind"] == "bgm"}
     map_data = read_json(game / "data" / f"Map{map_id:03d}.json")
+    map_data = adapt_stage_152(adapt_stage_151(adapt_stage_150(adapt_stage_142(map_data, map_id), map_id), map_id), map_id)
     w, h = int(map_data["width"]), int(map_data["height"])
 
     action_ids = [0] * (w * h)
@@ -1329,10 +1486,10 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
             for cmd in pg.get("list",[]):
                 par=cmd.get("parameters",[])
                 if cmd.get("code")==205 and len(par)>1 and int(par[0])>=0:
-                    if any(rc.get("code") in (13,16,17,18,19) for rc in par[1].get("list",[])):
+                    if any(rc.get("code") in ((1,2,3,4,13,16,17,18,19) if (80<=map_id<=104 or 111<=map_id<=139) else (13,16,17,18,19)) for rc in par[1].get("list",[])):
                         directional_targets.add(int(par[0]) or int(event['id']))
 
-    if map_id in (32,33,34,43):
+    if map_id in (32,33,34,43,95,120):
         directional_targets.update(e["id"] for e in map_data["events"] if e and any(p["moveType"]==3 for p in e["pages"]))
 
     for ev in map_data.get("events", []):
@@ -1379,7 +1536,7 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
                     # Keep conversion resilient for optional/broken tile pages.
                     continue
                 frame_key = ("__tile__", tile_id)
-                if map_id in (32,35,36,37,38,39,40,41,42,43,44,45):
+                if map_id in (32,35,109) or (36<=map_id<=104 or 111<=map_id<=139):
                     highres_half=True
                 else:
                     frame = frame.resize(
@@ -1408,7 +1565,12 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
                 # destroys strokes and turns English text into apparent random
                 # symbols.  Keep these source frames at PC resolution and let
                 # the PSP GPU downsample them at draw time with linear filtering.
-                highres_half = (36<=map_id<=45 and cname != "お邪魔ブロック！！") or (map_id in (32,33,34) and cname in ("!プレス機","!死体詰箱","!死体詰箱2","ベルトコンベア")) or (map_id==15 and cname in ("触手に拘束されるエンリちゃんドット","!鍵")) or (map_id==16 and event_id==36) or cname in ("keyの挿入装置", "!魔人の斧") or (cname == "!吊るしエンリ" and map_id in (21,23,27)) or map_id in (12,30) or (cname in ("!S-003","S-003") and map_id in (24,25,27,32,33,34,35,36,39)) or (map_id==27 and cname=="!鍵")
+                highres_half = ((36<=map_id<=104 or 111<=map_id<=139) and cname != "お邪魔ブロック！！") or (map_id in (32,33,34) and cname in ("!プレス機","!死体詰箱","!死体詰箱2","ベルトコンベア")) or (map_id==15 and cname in ("触手に拘束されるエンリちゃんドット","!鍵")) or (map_id==16 and event_id==36) or cname in ("keyの挿入装置", "!魔人の斧") or (cname == "!吊るしエンリ" and map_id in (21,23,27)) or map_id in (12,30) or (cname in ("!S-003","S-003") and map_id in (24,25,27,32,33,34,35,36,39,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,78)) or (map_id==27 and cname=="!鍵")
+
+                # Retain every source texel for protagonist poses, killer
+                # frames and hanging bodies, including early-map cutscenes.
+                if any(name in cname for name in ("エンリ", "S-003", "吊")):
+                    highres_half = True
 
                 if step_anim:
                     anim_frames = []
@@ -1416,7 +1578,7 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
                         af = extract_character_frame(
                             char_cache[cname], cname, cindex, direction, anim_pattern
                         )
-                        if cname in ("!吊るしエンリ","!クランク") and highres_half:
+                        if cname == "!クランク" and highres_half:
                             af = af.resize((af.width*3//4,af.height*3//4),Image.Resampling.LANCZOS)
                         if not highres_half:
                             af = af.resize(
@@ -1435,7 +1597,7 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
                     frame = extract_character_frame(
                         char_cache[cname], cname, cindex, direction, pattern
                     )
-                    if cname in ("!吊るしエンリ","!クランク") and highres_half:
+                    if cname == "!クランク" and highres_half:
                         frame = frame.resize((frame.width*3//4,frame.height*3//4),Image.Resampling.LANCZOS)
                     if not highres_half:
                         frame = frame.resize(
@@ -1444,12 +1606,10 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
                         )
                     source_frame_w, source_frame_h = frame.size
                     frame_key = (cname, cindex, direction, pattern, 1 if highres_half else 0)
-                if map_id in (33,34) and cname in ("!死体詰箱","!死体詰箱2"):
-                    frame=frame.resize((frame.width//2,frame.height//2),Image.Resampling.LANCZOS).resize(frame.size,Image.Resampling.NEAREST)
                 object_character = is_object_character(cname)
-                walk_sheet = (map_id==39 and event_id in (2,3,4,5) and cname.startswith("リメイク")) or (map_id == 30 and event_id in (3,4) and cname.startswith("リメイク")) or (map_id == 12 and event_id in directional_targets and (cname.startswith("リメイク") or (event_id == 1 and cname == "貴族エンリ"))) or (cname in ("!S-003","S-003") and cindex == 0 and map_id in (24,25,27,32,33,34,35,36,39))
-                directional = (map_id==39 and event_id in (2,3,4,5)) or (map_id==30 and event_id in (3,4)) or event_id in directional_targets and not (map_id == 12 and event_id == 2 and cname == "貴族エンリ") and not (map_id == 26 and event_id == 4 and page_index > 0)
-                if cname in ("!S-003","S-003") and map_id in (24,25,27,32,33,34,35,36,39):
+                walk_sheet = ((80<=map_id<=104 or 111<=map_id<=139) and event_id in directional_targets and (not is_object_character(cname) or (111<=map_id<=139 and "エーベル兄" in cname))) or (map_id in (67,68) and cname == "蜘蛛") or (map_id in (39,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64) and cname.startswith("リメイク") and cname.startswith("リメイク")) or (map_id == 30 and event_id in (3,4) and cname.startswith("リメイク")) or (map_id == 12 and event_id in directional_targets and (cname.startswith("リメイク") or (event_id == 1 and cname == "貴族エンリ"))) or (cname in ("!S-003","S-003") and cindex == 0 and map_id in (24,25,27,32,33,34,35,36,39,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,78))
+                directional = (map_id in (67,68) and cname == "蜘蛛") or (map_id in (39,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64) and cname.startswith("リメイク")) or (map_id==30 and event_id in (3,4)) or event_id in directional_targets and not (map_id == 12 and event_id == 2 and cname == "貴族エンリ") and not (map_id == 26 and event_id == 4 and page_index > 0)
+                if cname in ("!S-003","S-003") and map_id in (24,25,27,32,33,34,35,36,39,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,78):
                     directional = walk_sheet
                 if directional:
                     frames=[]
@@ -1457,23 +1617,30 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
                         row=[]
                         for pat in (range(3) if walk_sheet else [pattern]):
                             af=extract_character_frame(char_cache[cname],cname,cindex,d,pat)
-                            if cname in ("!S-003","S-003") and map_id in (27,32,33,34,35,36,39):
-                                af=af.resize((af.width*3//4,af.height*3//4),Image.Resampling.LANCZOS)
                             if not highres_half:
                                 af=af.resize((max(1,(af.width+1)//2),max(1,(af.height+1)//2)),Image.Resampling.LANCZOS if cname == "!S-003" else Image.Resampling.NEAREST)
                             row.append(af)
                         frames.append(row)
                     source_frame_w,source_frame_h=frames[0][0].size
-                    compact_sensor = map_id==43 and directional and highres_half
-                    compact_dirs = (cname in ("!S-003","S-003") or map_id==39) and walk_sheet and highres_half
+                    compact_sensor = (map_id==43 or 48<=map_id<=86 or 111<=map_id<=139) and directional and highres_half and not walk_sheet
+                    compact_dirs = walk_sheet and highres_half and map_id!=94
                     frame=Image.new("RGBA",(source_frame_w*(6 if compact_dirs else (2 if compact_sensor else (3 if walk_sheet else 1))),source_frame_h*(2 if compact_dirs or compact_sensor else 4)),(0,0,0,0))
                     for ri,row in enumerate(frames):
                         for pi,af in enumerate(row):
                             x=(ri%2*3+pi)*source_frame_w if compact_dirs else ((ri%2)*source_frame_w if compact_sensor else pi*source_frame_w)
                             y=(ri//2)*source_frame_h if compact_dirs or compact_sensor else ri*source_frame_h
                             frame.alpha_composite(af,(x,y))
-                    frame_key=("__walkdirs__" if walk_sheet else "__dirs__",cname,cindex,pattern,highres_half)
+                    frame_key=("__walkdirs__" if walk_sheet else "__dirs__",cname,cindex,1 if walk_sheet else pattern,highres_half)
                     step_anim=False
+
+                if map_id==72 and cname=="!デカ蜘蛛キャラチップ" and page.get("moveType")==3:
+                    source_frame_w,source_frame_h=extract_character_frame(char_cache[cname],cname,cindex,direction,1).size
+                    frame=Image.new("RGBA",(source_frame_w*2,source_frame_h*2))
+                    for pat in range(3):
+                        af=extract_character_frame(char_cache[cname],cname,cindex,direction,pat)
+                        frame.alpha_composite(af,((pat%2)*source_frame_w,(pat//2)*source_frame_h))
+                    frame_key=("__giant_gait__",cname,cindex,direction)
+                    walk_sheet=True;directional=False;step_anim=False
 
 
             sprite_frames.append((frame_key, frame))
@@ -1508,15 +1675,20 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
     atlas_path = out / f"map{map_id:03d}_event_atlas.rgba8888"
     preview_path = out / f"map{map_id:03d}_event_atlas_preview.png"
     if dedup:
-        if map_id in (15,16,24,25,27,30,32,33,34,35) or 36<=map_id<=45: dedup.sort(key=lambda item: (-item[1].height, -item[1].width))
-        if map_id in (32,39,40):
+        if map_id in (15,16,24,25,27,30,32,33,34,35) or (36<=map_id<=104 or 111<=map_id<=139): dedup.sort(key=lambda item: (-item[1].height, -item[1].width))
+        if True:  # Native cutscene sheets may need a second page on any map.
             atlases,positions=factory_atlas_pack(dedup)
             ev_atlas=atlases[0]
             # Always write page1: runtime knows this factory has a detail page.
-            detail=atlases[1] if len(atlases)>1 else Image.new("RGBA",(512,512),(0,0,0,0))
-            (out/f"map{map_id:03d}_event_atlas1.rgba8888").write_bytes(rgba8888_bytes(detail))
+            detail_path=out/f"map{map_id:03d}_event_atlas1.rgba8888"
+            if len(atlases)>1 or map_id in (32,39,40,47):
+                detail=atlases[1] if len(atlases)>1 else Image.new("RGBA",(512,512),(0,0,0,0))
+                detail_path.write_bytes(rgba8888_bytes(detail))
+            else:
+                # No packed sprite refers to page1; avoid an unused MiB on PSP.
+                detail_path.unlink(missing_ok=True)
         else:
-            ev_atlas, positions = rectangle_pack(dedup) if map_id in (33,34,35) or 36<=map_id<=45 else shelf_pack(dedup)
+            ev_atlas, positions = rectangle_pack(dedup) if map_id in (33,34,35) or (36<=map_id<=104 or 111<=map_id<=139) else shelf_pack(dedup)
         atlas_path.write_bytes(rgba8888_bytes(ev_atlas))
         ev_atlas.save(preview_path)
     else:
@@ -1561,7 +1733,8 @@ def prepare_dynamic_event_assets(game, out, key, texts, map_id):
     )
 
     vm_info = compile_map_vm(
-        map_data, texts, out / f"map{map_id:03d}_vm.bin", sprite_refs=sprite_refs
+        map_data, texts, out / f"map{map_id:03d}_vm.bin", sprite_refs=sprite_refs,
+        tile_flags=tileset["flags"] if map_id==69 else None
     )
     return {
         "map": map_id,
@@ -1624,6 +1797,7 @@ def prepare_map(game, out, key, tilesets, texts, font_path, map_id):
     # tile storage stays 48px, but each 2x2 block has one filtered PSP texel.
     if map_id in (33,34):
         for tile_id,slot in tile_to_slot.items():
+            if tile_id in (355,356,357,363,364,365): continue
             tile=rendered_tiles[tile_id]
             tile=tile.resize((24,24),Image.Resampling.LANCZOS).resize((48,48),Image.Resampling.NEAREST)
             idx=slot-1
@@ -1644,8 +1818,8 @@ def prepare_map(game, out, key, tilesets, texts, font_path, map_id):
                     layer_words.append(0)
                 else:
                     slot = tile_to_slot[tile_id]
-                    if (flags[tile_id] & 0x10) or (map_id == 25 and 5888 <= tile_id < 5936): slot |= 0x8000
-                    if 32<=map_id<=45 and tile_id in (135,143,151,161,162): slot |= 0x4000
+                    if (flags[tile_id] & 0x10) or (map_id in (25,38,41) and 5888 <= tile_id < 5936): slot |= 0x8000
+                    if (32<=map_id<=45 and tile_id in (135,143,151,161,162)) or (map_id in (33,34) and tile_id in (355,356,357,363,364,365)): slot |= 0x4000
                     layer_words.append(slot)
     pass_masks = bytes(build_pass_mask(map_data, flags, x, y) for y in range(h) for x in range(w))
     surface_types = bytearray(w * h)
@@ -1658,8 +1832,10 @@ def prepare_map(game, out, key, tilesets, texts, font_path, map_id):
                 surface_types[y*w+x] = 1
     start_x = 0
     start_y = 0
-    header = struct.pack("<4s8H", b"NM40", w, h, PSP_TILE, start_x, start_y, len(unique_ids), 0, 0)
+    header = struct.pack("<4s8H", b"NM40", w, h, PSP_TILE, start_x, start_y, len(unique_ids), 1, 0)
     body = b"".join(struct.pack("<H", v) for v in layer_words) + pass_masks + bytes(surface_types)
+    body += bytes(int(any(flags[tid] & 0x80 for tid in layered_ids(map_data, x, y)))
+                  for y in range(h) for x in range(w))
     (out / f"map{map_id:03d}.bin").write_bytes(header + body)
 
     # Event compilation.
