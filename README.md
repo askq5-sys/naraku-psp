@@ -58,6 +58,8 @@ unzip -t /path/to/naraku_psp_1.7.8_settings_alignment_patch.zip
 unzip -o /path/to/naraku_psp_1.7.8_settings_alignment_patch.zip
 chmod +x tools/build_deploy_v178.sh
 ./tools/build_deploy_v178.sh
+```
+
 Building requires a working PSP SDK environment.
 The deployment script accepts an optional destination directory.
 Restart the game after updating and load an in-game save.
